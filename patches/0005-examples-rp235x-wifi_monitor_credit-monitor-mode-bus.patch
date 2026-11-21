@@ -1,0 +1,177 @@
+From 4fa6a2e7d94b3e2d586cc274446c8a1af7006d0b Mon Sep 17 00:00:00 2001
+From: Chad Aldreda <ca@modelmiser.com>
+Date: Fri, 20 Nov 2026 15:13:33 -0800
+Subject: [PATCH 5/8] =?UTF-8?q?examples/rp235x:=20wifi=5Fmonitor=5Fcredit?=
+ =?UTF-8?q?=20=E2=80=94=20monitor=20mode,=20bus=20samples=20and=20the=20ra?=
+ =?UTF-8?q?w=20send-credit=20byte,=20no=20Bluetooth?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Run once on a Pico 2 W (2026-11-20).
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ .../rp235x/src/bin/wifi_monitor_credit.rs     | 150 ++++++++++++++++++
+ 1 file changed, 150 insertions(+)
+ create mode 100644 examples/rp235x/src/bin/wifi_monitor_credit.rs
+
+diff --git a/examples/rp235x/src/bin/wifi_monitor_credit.rs b/examples/rp235x/src/bin/wifi_monitor_credit.rs
+new file mode 100644
+index 000000000..c4a228d6c
+--- /dev/null
++++ b/examples/rp235x/src/bin/wifi_monitor_credit.rs
+@@ -0,0 +1,150 @@
++//! Monitor mode and send credit on a Pico 2 W, without Bluetooth, using the `diag` bus probe in
++//! `cyw43`. Parks the radio on channel 6 with the Wi-Fi Direct listen state, switches monitor on
++//! for three 15 s windows (three listen commands each), switches it off for one more, and prints
++//! per window: frames counted, packets read and unparsed, status samples that found a packet
++//! waiting, the driver's send sequence number and limit, and the raw credit byte from the
++//! firmware's packet headers.
++
++#![no_std]
++#![no_main]
++
++use cyw43::aligned_bytes;
++use cyw43_pio::{PioSpi, RM2_CLOCK_DIVIDER};
++use defmt::*;
++use defmt_rtt as _;
++use embassy_executor::Spawner;
++use embassy_rp::gpio::{Level, Output};
++use embassy_rp::peripherals::{DMA_CH0, DMA_CH1, PIO0};
++use embassy_rp::pio::{InterruptHandler, Pio};
++use embassy_rp::{bind_interrupts, dma};
++use embassy_time::Timer;
++use panic_probe as _;
++use static_cell::StaticCell;
++
++bind_interrupts!(struct Irqs {
++    PIO0_IRQ_0 => InterruptHandler<PIO0>;
++    DMA_IRQ_0 => dma::InterruptHandler<DMA_CH0>, dma::InterruptHandler<DMA_CH1>;
++});
++
++#[embassy_executor::task]
++async fn cyw43_task(
++    runner: cyw43::Runner<'static, cyw43::SpiBus<Output<'static>, PioSpi<'static, PIO0, 0>>, cyw43::Cyw43439>,
++) -> ! {
++    runner.run().await
++}
++
++/// Value for `bsscfg:p2p_state`: config index, state (0 scan, 1 listen), pad, chanspec, dwell ms.
++fn p2p_state(idx: u32, state: u8, chanspec: u16, dwell_ms: u16) -> [u8; 10] {
++    let mut v = [0u8; 10];
++    v[..4].copy_from_slice(&idx.to_le_bytes());
++    v[4] = state;
++    v[6..8].copy_from_slice(&chanspec.to_le_bytes());
++    v[8..10].copy_from_slice(&dwell_ms.to_le_bytes());
++    v
++}
++
++fn report(name: &str) {
++    let rx = cyw43::diag_rx_take();
++    let b = cyw43::diag_bus_take();
++    info!(
++        "{}: frames {} | pkts {} unparsed {} | samples {} avail {} irqs {} | seq {} max {} nocredit {} txstall {} | credit last {} min {} max {} seen {}",
++        name,
++        rx.frames,
++        b.pkts,
++        b.parse_fail,
++        b.samples,
++        b.avail,
++        b.irqs,
++        b.seq,
++        b.seq_max,
++        b.no_credit,
++        b.tx_stalled,
++        b.credit_last,
++        b.credit_min,
++        b.credit_max,
++        b.credit_seen
++    );
++}
++
++#[embassy_executor::main(executor = "embassy_rp::executor::Executor", entry = "cortex_m_rt::entry")]
++async fn main(spawner: Spawner) {
++    let p = embassy_rp::init(Default::default());
++    let fw = aligned_bytes!("../../../../cyw43-firmware/43439A0.bin");
++    let clm = aligned_bytes!("../../../../cyw43-firmware/43439A0_clm.bin");
++    let nvram = aligned_bytes!("../../../../cyw43-firmware/nvram_rp2040.bin");
++
++    let pwr = Output::new(p.PIN_23, Level::Low);
++    let cs = Output::new(p.PIN_25, Level::High);
++    let mut pio = Pio::new(p.PIO0, Irqs);
++    let spi = PioSpi::new(
++        &mut pio.common,
++        pio.sm0,
++        RM2_CLOCK_DIVIDER,
++        pio.irq0,
++        cs,
++        p.PIN_24,
++        p.PIN_29,
++        dma::Channel::new(p.DMA_CH0, Irqs),
++        dma::Channel::new(p.DMA_CH1, Irqs),
++    );
++
++    static STATE: StaticCell<cyw43::State> = StaticCell::new();
++    let state = STATE.init(cyw43::State::new());
++    let (_net_device, mut control, runner) = cyw43::new(state, pwr, spi, fw, nvram).await;
++    spawner.spawn(unwrap!(cyw43_task(runner)));
++    control.init(clm, cyw43::Config::default()).await;
++
++    cyw43::diag_bus_config(100, false);
++    let _ = cyw43::diag_bus_take();
++    Timer::after_secs(2).await;
++    report("baseline-2s");
++
++    let mut addr = control.address().await;
++    addr[0] |= 0x02;
++    let _ = control.diag_set_iovar("p2p_disc", &0u32.to_le_bytes()).await;
++    let _ = control.diag_set_iovar("p2p_da_override", &addr).await;
++    let s2 = control.diag_set_iovar("p2p_disc", &1u32.to_le_bytes()).await;
++    Timer::after_millis(500).await;
++    let mut res = [0u8; 16];
++    let (s3, _) = control.diag_get_iovar("p2p_dev", &mut res).await;
++    let idx = u32::from_le_bytes([res[0], res[1], res[2], res[3]]);
++    info!("p2p: disc1 {} p2p_dev {} index {}", s2, s3, idx);
++    let _ = control
++        .diag_set_iovar("bsscfg:p2p_state", &p2p_state(idx, 0, 0, 0))
++        .await;
++    let am = control.diag_set_allmulti(true).await;
++    report("setup");
++    let (ms, _) = control.diag_monitor(Some(1)).await;
++    info!("monitor on: allmulti {} set {}", am, ms);
++    for name in ["on-w0", "on-w1", "on-w2"] {
++        for _ in 0..3 {
++            let _ = control
++                .diag_set_iovar("bsscfg:p2p_state", &p2p_state(idx, 1, 0x1006, 5000))
++                .await;
++            Timer::after_millis(5200).await;
++        }
++        report(name);
++    }
++    let (m0, _) = control.diag_monitor(Some(0)).await;
++    Timer::after_millis(500).await;
++    info!("monitor off: {}", m0);
++    report("off-0.5s");
++    for _ in 0..3 {
++        let _ = control
++            .diag_set_iovar("bsscfg:p2p_state", &p2p_state(idx, 1, 0x1006, 5000))
++            .await;
++        Timer::after_millis(5200).await;
++    }
++    report("off-w3");
++    let _ = control.diag_set_allmulti(false).await;
++    let _ = control
++        .diag_set_iovar("bsscfg:p2p_state", &p2p_state(idx, 0, 0, 0))
++        .await;
++    let _ = control.diag_set_iovar("p2p_disc", &0u32.to_le_bytes()).await;
++    Timer::after_millis(500).await;
++    report("teardown");
++    info!("done");
++    loop {
++        Timer::after_secs(60).await;
++    }
++}
+-- 
+2.43.0
+

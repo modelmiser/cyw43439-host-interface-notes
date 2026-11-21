@@ -1,0 +1,332 @@
+From f8c1c0f20fc75fc37d57d984d81183d545844fcd Mon Sep 17 00:00:00 2001
+From: Chad Aldreda <ca@modelmiser.com>
+Date: Fri, 20 Nov 2026 17:50:59 -0800
+Subject: [PATCH 7/8] =?UTF-8?q?cyw43=20diag:=20keyhole=20=E2=80=94=20large?=
+ =?UTF-8?q?=20named-variable=20reads=20and=20bus-core=20registers;=20wifi?=
+ =?UTF-8?q?=5Fkeyhole=20example?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Reads what the firmware reports about itself (counters, memuse) and the bus
+core's registers around the monitor-mode stall. Run once on a Pico 2 W
+(2026-11-21).
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ cyw43/src/control.rs                    |  14 ++
+ cyw43/src/diag.rs                       |  23 +++
+ cyw43/src/lib.rs                        |   2 +-
+ cyw43/src/runner.rs                     |   8 +
+ examples/rp235x/src/bin/wifi_keyhole.rs | 197 ++++++++++++++++++++++++
+ 5 files changed, 243 insertions(+), 1 deletion(-)
+ create mode 100644 examples/rp235x/src/bin/wifi_keyhole.rs
+
+diff --git a/cyw43/src/control.rs b/cyw43/src/control.rs
+index 344a2eb9c..970eb428e 100644
+--- a/cyw43/src/control.rs
++++ b/cyw43/src/control.rs
+@@ -769,6 +769,20 @@ impl<'a> Control<'a> {
+         crate::diag::LAST_IOCTL_STATUS.load(core::sync::atomic::Ordering::Relaxed)
+     }
+ 
++    /// Diagnostic: read a named variable into a caller-sized buffer (for replies longer than 64
++    /// bytes). `buf` must hold the name, a NUL, and the reply. Returns the firmware's status and
++    /// the reply length; the reply starts at `buf[0]`.
++    pub async fn diag_get_iovar_buf(&mut self, name: &str, buf: &mut [u8]) -> (i32, usize) {
++        crate::diag::LAST_IOCTL_STATUS.store(crate::diag::DIAG_NO_REPLY, core::sync::atomic::Ordering::Relaxed);
++        buf.fill(0);
++        buf[..name.len()].copy_from_slice(name.as_bytes());
++        let len = self.ioctl_inner(IoctlType::Get, Ioctl::GetVar, 0, buf).await;
++        (
++            crate::diag::LAST_IOCTL_STATUS.load(core::sync::atomic::Ordering::Relaxed),
++            len,
++        )
++    }
++
+     /// Diagnostic: write a named variable (name + value at most 195 bytes). Returns the firmware's
+     /// status. For a `bsscfg:` name the caller puts the 4-byte index first in `val`.
+     pub async fn diag_set_iovar(&mut self, name: &str, val: &[u8]) -> i32 {
+diff --git a/cyw43/src/diag.rs b/cyw43/src/diag.rs
+index 87e78dca6..cb9fabbce 100644
+--- a/cyw43/src/diag.rs
++++ b/cyw43/src/diag.rs
+@@ -220,6 +220,11 @@ pub struct DiagBus {
+     pub credit_max: u8,
+     /// Headers that carried credit.
+     pub credit_seen: u32,
++    /// Bus-core registers at the last sample, when the keyhole is on: intstatus (0x20),
++    /// hostintmask (0x24), tosbmailboxdata (0x48), tohostmailboxdata (0x4C), then the twelve
++    /// counters at 0x110..=0x13C (cmd52rd, cmd52wr, cmd53rd, cmd53wr, abort, datacrcerror,
++    /// rdoutofsync, wroutofsync, writebusy, readwait, readterm, writeterm), as linux names them.
++    pub core: [u32; 16],
+ }
+ 
+ impl DiagBus {
+@@ -242,6 +247,7 @@ impl DiagBus {
+             credit_min: 0,
+             credit_max: 0,
+             credit_seen: 0,
++            core: [0; 16],
+         }
+     }
+ }
+@@ -337,3 +343,20 @@ pub fn diag_experiment(watermark: u8, ack_all: bool, poke: bool) {
+     X_ACK_ALL.store(ack_all, core::sync::atomic::Ordering::Relaxed);
+     X_POKE.store(poke, core::sync::atomic::Ordering::Relaxed);
+ }
++
++/// Whether the bus probe also reads the bus core's registers on each sample.
++pub(crate) static X_CORE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
++
++/// Offsets, from the bus core's base, of the registers the keyhole reads.
++pub(crate) const CORE_REGS: [u32; 16] = [
++    0x20, 0x24, 0x48, 0x4C, 0x110, 0x114, 0x118, 0x11C, 0x120, 0x124, 0x128, 0x12C, 0x130, 0x134, 0x138, 0x13C,
++];
++
++pub(crate) fn bus_core(vals: [u32; 16]) {
++    BUS.lock(|b| b.borrow_mut().core = vals);
++}
++
++/// Switch the bus-core keyhole on or off (it adds sixteen backplane reads to each bus sample).
++pub fn diag_keyhole(on: bool) {
++    X_CORE.store(on, core::sync::atomic::Ordering::Relaxed);
++}
+diff --git a/cyw43/src/lib.rs b/cyw43/src/lib.rs
+index b8a309516..df7deff29 100644
+--- a/cyw43/src/lib.rs
++++ b/cyw43/src/lib.rs
+@@ -37,7 +37,7 @@ use ioctl::IoctlState;
+ pub use crate::control::{ApAuth, Config, Control, JoinAuth, JoinError, JoinOptions, ScanOptions, ScanType, Scanner};
+ pub use crate::diag::{
+     DIAG_EV_SAMPLED, DIAG_EV_SAMPLES, DIAG_HEAD, DIAG_NO_REPLY, DIAG_SAMPLES, DiagBus, DiagEvents, DiagRx,
+-    diag_bus_config, diag_bus_take, diag_events_take, diag_experiment, diag_rx_take,
++    diag_bus_config, diag_bus_take, diag_events_take, diag_experiment, diag_keyhole, diag_rx_take,
+ };
+ pub use crate::runner::Runner;
+ pub use crate::sdio::SdioBus;
+diff --git a/cyw43/src/runner.rs b/cyw43/src/runner.rs
+index b6a502a7e..c0bcc1669 100644
+--- a/cyw43/src/runner.rs
++++ b/cyw43/src/runner.rs
+@@ -991,6 +991,14 @@ impl<'a, BUS: Bus, CHIP: Chip> Runner<'a, BUS, CHIP> {
+         let status = self.bus.read32(FUNC_BUS, SPI_STATUS_REGISTER).await;
+         let irq = self.bus.read16(FUNC_BUS, REG_BUS_INTERRUPT).await;
+         crate::diag::bus_sample(status, irq, self.sdpcm_seq, self.sdpcm_seq_max, self.has_credit());
++        if crate::diag::X_CORE.load(Relaxed) {
++            let base = self.chip.sdiod_core_base_address();
++            let mut vals = [0u32; 16];
++            for (v, off) in vals.iter_mut().zip(crate::diag::CORE_REGS) {
++                *v = self.bus.bp_read32(base + off).await;
++            }
++            crate::diag::bus_core(vals);
++        }
+         if crate::diag::X_POKE.load(Relaxed) {
+             self.bus
+                 .bp_write32(self.chip.sdiod_core_base_address() + SDIO_TO_SB_MAILBOX, SMB_DEV_INT)
+diff --git a/examples/rp235x/src/bin/wifi_keyhole.rs b/examples/rp235x/src/bin/wifi_keyhole.rs
+new file mode 100644
+index 000000000..535303a5e
+--- /dev/null
++++ b/examples/rp235x/src/bin/wifi_keyhole.rs
+@@ -0,0 +1,197 @@
++//! Keyhole probe: what the firmware reports about itself, through names and registers the public
++//! drivers define, before, during and after the monitor-mode stall. No Bluetooth. At each
++//! checkpoint: the "counters" record (whd defines the name and the record layouts), "memuse", and
++//! the bus core's registers as linux names them (interrupt status, mailboxes, twelve counters).
++
++#![no_std]
++#![no_main]
++
++use cyw43::aligned_bytes;
++use cyw43_pio::{PioSpi, RM2_CLOCK_DIVIDER};
++use defmt::*;
++use defmt_rtt as _;
++use embassy_executor::Spawner;
++use embassy_rp::gpio::{Level, Output};
++use embassy_rp::peripherals::{DMA_CH0, DMA_CH1, PIO0};
++use embassy_rp::pio::{InterruptHandler, Pio};
++use embassy_rp::{bind_interrupts, dma};
++use embassy_time::Timer;
++use panic_probe as _;
++use static_cell::StaticCell;
++
++bind_interrupts!(struct Irqs {
++    PIO0_IRQ_0 => InterruptHandler<PIO0>;
++    DMA_IRQ_0 => dma::InterruptHandler<DMA_CH0>, dma::InterruptHandler<DMA_CH1>;
++});
++
++#[embassy_executor::task]
++async fn cyw43_task(
++    runner: cyw43::Runner<'static, cyw43::SpiBus<Output<'static>, PioSpi<'static, PIO0, 0>>, cyw43::Cyw43439>,
++) -> ! {
++    runner.run().await
++}
++
++/// Value for `bsscfg:p2p_state`: config index, state (0 scan, 1 listen), pad, chanspec, dwell ms.
++fn p2p_state(idx: u32, state: u8, chanspec: u16, dwell_ms: u16) -> [u8; 10] {
++    let mut v = [0u8; 10];
++    v[..4].copy_from_slice(&idx.to_le_bytes());
++    v[4] = state;
++    v[6..8].copy_from_slice(&chanspec.to_le_bytes());
++    v[8..10].copy_from_slice(&dwell_ms.to_le_bytes());
++    v
++}
++
++async fn keyhole(control: &mut cyw43::Control<'static>, name: &str) {
++    static mut BUF: [u8; 1040] = [0; 1040];
++    // SAFETY: single task, used sequentially.
++    #[allow(static_mut_refs)]
++    let buf = unsafe { &mut BUF };
++    Timer::after_millis(250).await;
++    let b = cyw43::diag_bus_take();
++    info!(
++        "{} core intstatus {:08x} hostintmask {:08x} tosb {:08x} tohost {:08x} | cmd52rd {} cmd52wr {} cmd53rd {} cmd53wr {} abort {} datacrcerror {} rdoutofsync {} wroutofsync {} writebusy {} readwait {} readterm {} writeterm {}",
++        name,
++        b.core[0],
++        b.core[1],
++        b.core[2],
++        b.core[3],
++        b.core[4],
++        b.core[5],
++        b.core[6],
++        b.core[7],
++        b.core[8],
++        b.core[9],
++        b.core[10],
++        b.core[11],
++        b.core[12],
++        b.core[13],
++        b.core[14],
++        b.core[15]
++    );
++    let (status, len) = control.diag_get_iovar_buf("counters", &mut buf[..]).await;
++    let ver = u16::from_le_bytes([buf[0], buf[1]]);
++    let reclen = u16::from_le_bytes([buf[2], buf[3]]) as usize;
++    info!(
++        "{} counters status {} len {} version {} reclen {}",
++        name, status, len, ver, reclen
++    );
++    if status == 0 {
++        let n = reclen.clamp(4, len.min(1040));
++        for (i, chunk) in buf[..n].chunks(64).enumerate() {
++            info!("{} C{:04} {=[u8]:02x}", name, i * 64, chunk);
++        }
++    }
++    let (status, len) = control.diag_get_iovar_buf("memuse", &mut buf[..512]).await;
++    info!("{} memuse status {} len {}", name, status, len);
++    if status == 0 {
++        let n = buf[..len.min(512)].iter().position(|c| *c == 0).unwrap_or(len.min(512));
++        for (i, chunk) in buf[..n.max(16).min(512)].chunks(64).enumerate() {
++            info!("{} M{:04} {=[u8]:02x}", name, i * 64, chunk);
++        }
++    }
++}
++
++fn report(name: &str) {
++    let rx = cyw43::diag_rx_take();
++    let b = cyw43::diag_bus_take();
++    info!(
++        "{}: frames {} | pkts {} unparsed {} | samples {} avail {} irqs {} | seq {} max {} nocredit {} txstall {} | credit last {} min {} max {} seen {}",
++        name,
++        rx.frames,
++        b.pkts,
++        b.parse_fail,
++        b.samples,
++        b.avail,
++        b.irqs,
++        b.seq,
++        b.seq_max,
++        b.no_credit,
++        b.tx_stalled,
++        b.credit_last,
++        b.credit_min,
++        b.credit_max,
++        b.credit_seen
++    );
++}
++
++#[embassy_executor::main(executor = "embassy_rp::executor::Executor", entry = "cortex_m_rt::entry")]
++async fn main(spawner: Spawner) {
++    let p = embassy_rp::init(Default::default());
++    let fw = aligned_bytes!("../../../../cyw43-firmware/43439A0.bin");
++    let clm = aligned_bytes!("../../../../cyw43-firmware/43439A0_clm.bin");
++    let nvram = aligned_bytes!("../../../../cyw43-firmware/nvram_rp2040.bin");
++
++    let pwr = Output::new(p.PIN_23, Level::Low);
++    let cs = Output::new(p.PIN_25, Level::High);
++    let mut pio = Pio::new(p.PIO0, Irqs);
++    let spi = PioSpi::new(
++        &mut pio.common,
++        pio.sm0,
++        RM2_CLOCK_DIVIDER,
++        pio.irq0,
++        cs,
++        p.PIN_24,
++        p.PIN_29,
++        dma::Channel::new(p.DMA_CH0, Irqs),
++        dma::Channel::new(p.DMA_CH1, Irqs),
++    );
++
++    static STATE: StaticCell<cyw43::State> = StaticCell::new();
++    let state = STATE.init(cyw43::State::new());
++    let (_net_device, mut control, runner) = cyw43::new(state, pwr, spi, fw, nvram).await;
++    spawner.spawn(unwrap!(cyw43_task(runner)));
++    control.init(clm, cyw43::Config::default()).await;
++
++    cyw43::diag_bus_config(100, false);
++    cyw43::diag_keyhole(true);
++    let _ = cyw43::diag_bus_take();
++    Timer::after_secs(2).await;
++    report("baseline-2s");
++    keyhole(&mut control, "k0-baseline").await;
++
++    let mut addr = control.address().await;
++    addr[0] |= 0x02;
++    let _ = control.diag_set_iovar("p2p_disc", &0u32.to_le_bytes()).await;
++    let _ = control.diag_set_iovar("p2p_da_override", &addr).await;
++    let s2 = control.diag_set_iovar("p2p_disc", &1u32.to_le_bytes()).await;
++    Timer::after_millis(500).await;
++    let mut res = [0u8; 16];
++    let (s3, _) = control.diag_get_iovar("p2p_dev", &mut res).await;
++    let idx = u32::from_le_bytes([res[0], res[1], res[2], res[3]]);
++    info!("p2p: disc1 {} p2p_dev {} index {}", s2, s3, idx);
++    let _ = control
++        .diag_set_iovar("bsscfg:p2p_state", &p2p_state(idx, 0, 0, 0))
++        .await;
++    let am = control.diag_set_allmulti(true).await;
++    report("setup");
++    keyhole(&mut control, "k1-before-monitor").await;
++    let (ms, _) = control.diag_monitor(Some(1)).await;
++    info!("monitor on: allmulti {} set {}", am, ms);
++    for name in ["on-w0", "on-w1"] {
++        for _ in 0..3 {
++            let _ = control
++                .diag_set_iovar("bsscfg:p2p_state", &p2p_state(idx, 1, 0x1006, 5000))
++                .await;
++            Timer::after_millis(5200).await;
++        }
++        report(name);
++        keyhole(&mut control, name).await;
++    }
++    let (m0, _) = control.diag_monitor(Some(0)).await;
++    Timer::after_millis(500).await;
++    info!("monitor off: {}", m0);
++    report("off-0.5s");
++    keyhole(&mut control, "k4-monitor-off").await;
++    let _ = control.diag_set_allmulti(false).await;
++    let _ = control
++        .diag_set_iovar("bsscfg:p2p_state", &p2p_state(idx, 0, 0, 0))
++        .await;
++    let _ = control.diag_set_iovar("p2p_disc", &0u32.to_le_bytes()).await;
++    Timer::after_millis(500).await;
++    report("teardown");
++    keyhole(&mut control, "k5-teardown").await;
++    info!("done");
++    loop {
++        Timer::after_secs(60).await;
++    }
++}
+-- 
+2.43.0
+

@@ -1,0 +1,313 @@
+From 55b9181719b02d295f9b734a374f1cc9be3c6382 Mon Sep 17 00:00:00 2001
+From: Chad Aldreda <ca@modelmiser.com>
+Date: Fri, 20 Nov 2026 15:06:17 -0800
+Subject: [PATCH 4/8] =?UTF-8?q?cyw43=20diag:=20bus=20probe=20in=20the=20ru?=
+ =?UTF-8?q?nner=20=E2=80=94=20status/interrupt=20samples,=20packets=20read?=
+ =?UTF-8?q?,=20parse=20failures,=20raw=20credit?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Samples from the interrupt path (rate-limited) and from a timer when idle;
+optional read of a waiting packet. SPI only. Compiled and unit-tested; this
+exact version has not been run on hardware (an earlier local variant was).
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ cyw43/src/diag.rs   | 146 ++++++++++++++++++++++++++++++++++++++++++++
+ cyw43/src/lib.rs    |   4 +-
+ cyw43/src/runner.rs |  44 ++++++++++++-
+ 3 files changed, 189 insertions(+), 5 deletions(-)
+
+diff --git a/cyw43/src/diag.rs b/cyw43/src/diag.rs
+index 3e6879950..caa53ab72 100644
+--- a/cyw43/src/diag.rs
++++ b/cyw43/src/diag.rs
+@@ -176,3 +176,149 @@ pub(crate) fn event(code: u8, datalen: u32, addr: [u8; 6], data: &[u8]) {
+ pub fn diag_events_take() -> DiagEvents {
+     EV.lock(|ev| ev.replace(DiagEvents::new()))
+ }
++
++/// Sampling period of the bus probe in the runner, in ms; 0 = off.
++pub(crate) static SAMPLE_MS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
++/// Whether a sample that finds a packet waiting also reads it.
++pub(crate) static DRAIN: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
++
++/// What the runner saw on the bus since the previous `diag_bus_take` (SPI bus only).
++#[derive(Clone, Copy)]
++pub struct DiagBus {
++    /// Status/interrupt register samples taken.
++    pub samples: u32,
++    /// Samples whose status register had "F2 packet available" set.
++    pub avail: u32,
++    /// Samples whose interrupt register had "F2 packet available" set.
++    pub irq_avail: u32,
++    /// Samples taken while the runner had no credit to send.
++    pub no_credit: u32,
++    /// Status register at the last sample.
++    pub last_status: u32,
++    /// Interrupt register at the last sample.
++    pub last_irq: u16,
++    /// OR of every interrupt register value seen.
++    pub irq_or: u16,
++    /// Times the interrupt handler ran.
++    pub irqs: u32,
++    /// Packets read from the bus.
++    pub pkts: u32,
++    /// Packets read whose SDPCM header did not parse (these update neither credit nor counters).
++    pub parse_fail: u32,
++    /// Times the runner found it had no credit to send.
++    pub tx_stalled: u32,
++    /// The runner's send sequence number and the limit it derived, at the last sample or stall.
++    pub seq: u8,
++    /// See `seq`.
++    pub seq_max: u8,
++    /// Raw `bus_data_credit` byte of the last header on a credit-carrying channel, and the
++    /// lowest and highest seen in the interval (`credit_seen` = 0 means none arrived).
++    pub credit_last: u8,
++    /// See `credit_last`.
++    pub credit_min: u8,
++    /// See `credit_last`.
++    pub credit_max: u8,
++    /// Headers that carried credit.
++    pub credit_seen: u32,
++}
++
++impl DiagBus {
++    const fn new() -> Self {
++        Self {
++            samples: 0,
++            avail: 0,
++            irq_avail: 0,
++            no_credit: 0,
++            last_status: 0,
++            last_irq: 0,
++            irq_or: 0,
++            irqs: 0,
++            pkts: 0,
++            parse_fail: 0,
++            tx_stalled: 0,
++            seq: 0,
++            seq_max: 0,
++            credit_last: 0,
++            credit_min: 0,
++            credit_max: 0,
++            credit_seen: 0,
++        }
++    }
++}
++
++static BUS: Mutex<CriticalSectionRawMutex, RefCell<DiagBus>> = Mutex::new(RefCell::new(DiagBus::new()));
++
++pub(crate) fn bus_sample(status: u32, irq: u16, seq: u8, seq_max: u8, has_credit: bool) {
++    BUS.lock(|b| {
++        let mut b = b.borrow_mut();
++        b.samples = b.samples.wrapping_add(1);
++        if status & 0x100 != 0 {
++            b.avail = b.avail.wrapping_add(1);
++        }
++        if irq & 0x20 != 0 {
++            b.irq_avail = b.irq_avail.wrapping_add(1);
++        }
++        if !has_credit {
++            b.no_credit = b.no_credit.wrapping_add(1);
++        }
++        b.last_status = status;
++        b.last_irq = irq;
++        b.irq_or |= irq;
++        b.seq = seq;
++        b.seq_max = seq_max;
++    });
++}
++
++pub(crate) fn bus_irq(irq: u16) {
++    BUS.lock(|b| {
++        let mut b = b.borrow_mut();
++        b.irqs = b.irqs.wrapping_add(1);
++        b.irq_or |= irq;
++    });
++}
++
++pub(crate) fn bus_pkt(parsed: bool) {
++    BUS.lock(|b| {
++        let mut b = b.borrow_mut();
++        b.pkts = b.pkts.wrapping_add(1);
++        if !parsed {
++            b.parse_fail = b.parse_fail.wrapping_add(1);
++        }
++    });
++}
++
++pub(crate) fn bus_credit(raw: u8) {
++    BUS.lock(|b| {
++        let mut b = b.borrow_mut();
++        if b.credit_seen == 0 {
++            b.credit_min = raw;
++            b.credit_max = raw;
++        }
++        b.credit_min = b.credit_min.min(raw);
++        b.credit_max = b.credit_max.max(raw);
++        b.credit_last = raw;
++        b.credit_seen = b.credit_seen.wrapping_add(1);
++    });
++}
++
++pub(crate) fn bus_tx_stalled(seq: u8, seq_max: u8) {
++    BUS.lock(|b| {
++        let mut b = b.borrow_mut();
++        b.tx_stalled = b.tx_stalled.wrapping_add(1);
++        b.seq = seq;
++        b.seq_max = seq_max;
++    });
++}
++
++/// Take and reset the bus probe's counters.
++pub fn diag_bus_take() -> DiagBus {
++    BUS.lock(|b| b.replace(DiagBus::new()))
++}
++
++/// Configure the bus probe: on the SPI bus the runner samples the status and interrupt registers
++/// every `sample_ms` (0 = off), whether it was woken by an interrupt or by its own timer; with
++/// `drain`, a sample that finds a packet waiting reads it.
++pub fn diag_bus_config(sample_ms: u32, drain: bool) {
++    DRAIN.store(drain, core::sync::atomic::Ordering::Relaxed);
++    SAMPLE_MS.store(sample_ms, core::sync::atomic::Ordering::Relaxed);
++}
+diff --git a/cyw43/src/lib.rs b/cyw43/src/lib.rs
+index 2208a9184..732e13103 100644
+--- a/cyw43/src/lib.rs
++++ b/cyw43/src/lib.rs
+@@ -36,8 +36,8 @@ use ioctl::IoctlState;
+ 
+ pub use crate::control::{ApAuth, Config, Control, JoinAuth, JoinError, JoinOptions, ScanOptions, ScanType, Scanner};
+ pub use crate::diag::{
+-    DIAG_EV_SAMPLED, DIAG_EV_SAMPLES, DIAG_HEAD, DIAG_NO_REPLY, DIAG_SAMPLES, DiagEvents, DiagRx, diag_events_take,
+-    diag_rx_take,
++    DIAG_EV_SAMPLED, DIAG_EV_SAMPLES, DIAG_HEAD, DIAG_NO_REPLY, DIAG_SAMPLES, DiagBus, DiagEvents, DiagRx,
++    diag_bus_config, diag_bus_take, diag_events_take, diag_rx_take,
+ };
+ pub use crate::runner::Runner;
+ pub use crate::sdio::SdioBus;
+diff --git a/cyw43/src/runner.rs b/cyw43/src/runner.rs
+index 9ddee98bd..cc8638bf1 100644
+--- a/cyw43/src/runner.rs
++++ b/cyw43/src/runner.rs
+@@ -7,7 +7,7 @@ use aligned::{A4, Aligned};
+ use embassy_futures::select::{Either, Either4, select, select4};
+ use embassy_net_driver_channel as ch;
+ use embassy_net_driver_channel::driver::LinkState;
+-use embassy_time::Duration;
++use embassy_time::{Duration, Instant, Timer};
+ use sdio::sdio::{CCCR_INT_ENABLE, CCCR_IO_ENABLE, CCCR_IO_READY};
+ 
+ use crate::chip::{
+@@ -96,6 +96,8 @@ pub struct Runner<'a, BUS: Bus, CHIP: Chip> {
+     ioctl_id: u16,
+     sdpcm_seq: u8,
+     sdpcm_seq_max: u8,
++    /// When the diagnostic bus probe last sampled.
++    diag_last: Instant,
+ 
+     /// An ioctl sent by the runner itself is in flight: its response goes to
+     /// `rx` and clears this flag, instead of going to `ioctl_state`.
+@@ -137,6 +139,7 @@ impl<'a, BUS: Bus, CHIP: Chip> Runner<'a, BUS, CHIP> {
+             ioctl_id: 0,
+             sdpcm_seq: 0,
+             sdpcm_seq_max: 1,
++            diag_last: Instant::now(),
+             inline_ioctl_pending: false,
+             mcast_gen: 0,
+             allmulti: false,
+@@ -856,7 +859,14 @@ impl<'a, BUS: Bus, CHIP: Chip> Runner<'a, BUS, CHIP> {
+                 #[cfg(not(feature = "bluetooth"))]
+                 let bt_work = core::future::pending::<Either<(), ()>>();
+ 
+-                let ev = self.bus.wait_for_event();
++                let diag_ms = crate::diag::SAMPLE_MS.load(Relaxed);
++                let ev = select(self.bus.wait_for_event(), async move {
++                    if diag_ms == 0 {
++                        core::future::pending::<()>().await
++                    } else {
++                        Timer::after_millis(diag_ms as u64).await
++                    }
++                });
+ 
+                 match select4(select(ioctl, mcast), wifi_tx, bt_work, ev).await {
+                     Either4::First(Either::First(PendingIoctl { len, kind, cmd, iface })) => {
+@@ -933,12 +943,16 @@ impl<'a, BUS: Bus, CHIP: Chip> Runner<'a, BUS, CHIP> {
+                         #[cfg(feature = "bluetooth")]
+                         self.bt.as_mut().unwrap().hci_write(&mut self.bus, &mut buf).await;
+                     }
+-                    Either4::Third(Either::First(())) | Either4::Fourth(()) => {
++                    Either4::Third(Either::First(())) | Either4::Fourth(Either::First(())) => {
+                         self.handle_irq(&mut buf).await;
+                     }
++                    Either4::Fourth(Either::Second(())) => {
++                        self.diag_sample(&mut buf).await;
++                    }
+                 }
+             } else {
+                 warn!("TX stalled");
++                crate::diag::bus_tx_stalled(self.sdpcm_seq, self.sdpcm_seq_max);
+                 if matches!(self.bus.bus_type(), BusType::Sdio) {
+                     // whd_bus_sdio_poke_wlan
+                     self.bus
+@@ -963,6 +977,21 @@ impl<'a, BUS: Bus, CHIP: Chip> Runner<'a, BUS, CHIP> {
+     }
+ 
+     /// Wait for IRQ on F2 packet available
++    /// Diagnostic: sample the bus status and interrupt registers without being asked to by an
++    /// interrupt or a command; optionally read a waiting packet. SPI only.
++    async fn diag_sample(&mut self, buf: &mut Aligned<A4, [u8]>) {
++        self.diag_last = Instant::now();
++        if !matches!(BUS::TYPE, BusType::Spi) {
++            return;
++        }
++        let status = self.bus.read32(FUNC_BUS, SPI_STATUS_REGISTER).await;
++        let irq = self.bus.read16(FUNC_BUS, REG_BUS_INTERRUPT).await;
++        crate::diag::bus_sample(status, irq, self.sdpcm_seq, self.sdpcm_seq_max, self.has_credit());
++        if crate::diag::DRAIN.load(Relaxed) && status & STATUS_F2_PKT_AVAILABLE != 0 {
++            self.check_status(buf).await;
++        }
++    }
++
+     async fn handle_irq(&mut self, buf: &mut Aligned<A4, [u8]>) {
+         match BUS::TYPE {
+             BusType::Sdio => {
+@@ -1014,7 +1043,13 @@ impl<'a, BUS: Bus, CHIP: Chip> Runner<'a, BUS, CHIP> {
+             }
+             BusType::Spi => {
+                 // Receive stuff
++                // Diagnostic: rate-limited status sample even when interrupts keep the loop busy.
++                let diag_ms = crate::diag::SAMPLE_MS.load(Relaxed);
++                if diag_ms != 0 && self.diag_last.elapsed() >= Duration::from_millis(diag_ms as u64) {
++                    self.diag_sample(buf).await;
++                }
+                 let irq = self.bus.read16(FUNC_BUS, REG_BUS_INTERRUPT).await;
++                crate::diag::bus_irq(irq);
+                 if irq != 0 {
+                     trace!("irq{}", FormatInterrupt(irq));
+                 }
+@@ -1151,9 +1186,11 @@ impl<'a, BUS: Bus, CHIP: Chip> Runner<'a, BUS, CHIP> {
+     fn rx(&mut self, buf: &mut [u8]) -> Option<Reception> {
+         let Some((sdpcm_header, payload)) = SdpcmHeader::parse(buf) else {
+             debug!("failed to parse sdpcm header");
++            crate::diag::bus_pkt(false);
+ 
+             return None;
+         };
++        crate::diag::bus_pkt(true);
+ 
+         self.update_credit(sdpcm_header);
+ 
+@@ -1376,6 +1413,7 @@ impl<'a, BUS: Bus, CHIP: Chip> Runner<'a, BUS, CHIP> {
+ 
+     fn update_credit(&mut self, sdpcm_header: &SdpcmHeader) {
+         if sdpcm_header.channel_and_flags & 0xf < 3 {
++            crate::diag::bus_credit(sdpcm_header.bus_data_credit);
+             let mut sdpcm_seq_max = sdpcm_header.bus_data_credit;
+             if sdpcm_seq_max.wrapping_sub(self.sdpcm_seq) > 0x40 {
+                 sdpcm_seq_max = self.sdpcm_seq + 2;
+-- 
+2.43.0
+

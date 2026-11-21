@@ -1,0 +1,268 @@
+From 049ff51a3d9c7c1d90d6ad5fdd88dd061adec6a6 Mon Sep 17 00:00:00 2001
+From: Chad Aldreda <ca@modelmiser.com>
+Date: Fri, 20 Nov 2026 16:39:10 -0800
+Subject: [PATCH 6/8] cyw43 diag: experiment knobs (F2 watermark, acknowledge
+ all interrupt bits, poke) and a variants example
+
+Used to test three host-side explanations for the monitor-mode stall on a
+Pico 2 W (2026-11-21); none changed the result.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ cyw43/src/diag.rs                             |  15 ++
+ cyw43/src/lib.rs                              |   2 +-
+ cyw43/src/runner.rs                           |  18 +-
+ .../rp235x/src/bin/wifi_monitor_variants.rs   | 161 ++++++++++++++++++
+ 4 files changed, 193 insertions(+), 3 deletions(-)
+ create mode 100644 examples/rp235x/src/bin/wifi_monitor_variants.rs
+
+diff --git a/cyw43/src/diag.rs b/cyw43/src/diag.rs
+index caa53ab72..87e78dca6 100644
+--- a/cyw43/src/diag.rs
++++ b/cyw43/src/diag.rs
+@@ -322,3 +322,18 @@ pub fn diag_bus_config(sample_ms: u32, drain: bool) {
+     DRAIN.store(drain, core::sync::atomic::Ordering::Relaxed);
+     SAMPLE_MS.store(sample_ms, core::sync::atomic::Ordering::Relaxed);
+ }
++
++/// Experiment knobs (driver variants for the monitor-mode stall). 0 = the driver's own watermark.
++pub(crate) static X_WATERMARK: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
++/// Acknowledge every interrupt-register bit read, as the C driver and whd do.
++pub(crate) static X_ACK_ALL: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
++/// On each bus sample, write the SDIO-style "poke" to the bus core's mailbox register.
++pub(crate) static X_POKE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
++
++/// Select driver variants for an experiment. Call before `cyw43::new` (the watermark is written
++/// during bring-up). `watermark` 0 keeps the driver's value.
++pub fn diag_experiment(watermark: u8, ack_all: bool, poke: bool) {
++    X_WATERMARK.store(watermark, core::sync::atomic::Ordering::Relaxed);
++    X_ACK_ALL.store(ack_all, core::sync::atomic::Ordering::Relaxed);
++    X_POKE.store(poke, core::sync::atomic::Ordering::Relaxed);
++}
+diff --git a/cyw43/src/lib.rs b/cyw43/src/lib.rs
+index 732e13103..b8a309516 100644
+--- a/cyw43/src/lib.rs
++++ b/cyw43/src/lib.rs
+@@ -37,7 +37,7 @@ use ioctl::IoctlState;
+ pub use crate::control::{ApAuth, Config, Control, JoinAuth, JoinError, JoinOptions, ScanOptions, ScanType, Scanner};
+ pub use crate::diag::{
+     DIAG_EV_SAMPLED, DIAG_EV_SAMPLES, DIAG_HEAD, DIAG_NO_REPLY, DIAG_SAMPLES, DiagBus, DiagEvents, DiagRx,
+-    diag_bus_config, diag_bus_take, diag_events_take, diag_rx_take,
++    diag_bus_config, diag_bus_take, diag_events_take, diag_experiment, diag_rx_take,
+ };
+ pub use crate::runner::Runner;
+ pub use crate::sdio::SdioBus;
+diff --git a/cyw43/src/runner.rs b/cyw43/src/runner.rs
+index cc8638bf1..b6a502a7e 100644
+--- a/cyw43/src/runner.rs
++++ b/cyw43/src/runner.rs
+@@ -676,8 +676,12 @@ impl<'a, BUS: Bus, CHIP: Chip> Runner<'a, BUS, CHIP> {
+ 
+                 // "Lower F2 Watermark to avoid DMA Hang in F2 when SD Clock is stopped."
+                 // Sounds scary...
++                let wm = match crate::diag::X_WATERMARK.load(Relaxed) {
++                    0 => SPI_F2_WATERMARK,
++                    v => v,
++                };
+                 self.bus
+-                    .write8(FUNC_BACKPLANE, REG_BACKPLANE_FUNCTION2_WATERMARK, SPI_F2_WATERMARK)
++                    .write8(FUNC_BACKPLANE, REG_BACKPLANE_FUNCTION2_WATERMARK, wm)
+                     .await;
+             }
+         }
+@@ -987,6 +991,11 @@ impl<'a, BUS: Bus, CHIP: Chip> Runner<'a, BUS, CHIP> {
+         let status = self.bus.read32(FUNC_BUS, SPI_STATUS_REGISTER).await;
+         let irq = self.bus.read16(FUNC_BUS, REG_BUS_INTERRUPT).await;
+         crate::diag::bus_sample(status, irq, self.sdpcm_seq, self.sdpcm_seq_max, self.has_credit());
++        if crate::diag::X_POKE.load(Relaxed) {
++            self.bus
++                .bp_write32(self.chip.sdiod_core_base_address() + SDIO_TO_SB_MAILBOX, SMB_DEV_INT)
++                .await;
++        }
+         if crate::diag::DRAIN.load(Relaxed) && status & STATUS_F2_PKT_AVAILABLE != 0 {
+             self.check_status(buf).await;
+         }
+@@ -1058,7 +1067,12 @@ impl<'a, BUS: Bus, CHIP: Chip> Runner<'a, BUS, CHIP> {
+                     self.check_status(buf).await;
+                 }
+ 
+-                if irq & IRQ_DATA_UNAVAILABLE != 0 {
++                if crate::diag::X_ACK_ALL.load(Relaxed) {
++                    // Experiment: acknowledge every bit read (write-1-to-clear), after draining.
++                    if irq != 0 {
++                        self.bus.write16(FUNC_BUS, REG_BUS_INTERRUPT, irq).await;
++                    }
++                } else if irq & IRQ_DATA_UNAVAILABLE != 0 {
+                     // this seems to be ignorable with no ill effects.
+                     trace!("IRQ DATA_UNAVAILABLE, clearing...");
+                     self.bus.write16(FUNC_BUS, REG_BUS_INTERRUPT, 1).await;
+diff --git a/examples/rp235x/src/bin/wifi_monitor_variants.rs b/examples/rp235x/src/bin/wifi_monitor_variants.rs
+new file mode 100644
+index 000000000..33068650a
+--- /dev/null
++++ b/examples/rp235x/src/bin/wifi_monitor_variants.rs
+@@ -0,0 +1,161 @@
++//! EXPERIMENT VARIANTS of wifi_monitor_credit: the same sequence with one driver knob changed,
++//! chosen at build time by the VARIANT environment variable (wm16, wm64, ack, poke; anything else = base).
++//! Monitor mode and send credit on a Pico 2 W, without Bluetooth, using the `diag` bus probe in
++//! `cyw43`. Parks the radio on channel 6 with the Wi-Fi Direct listen state, switches monitor on
++//! for three 15 s windows (three listen commands each), switches it off for one more, and prints
++//! per window: frames counted, packets read and unparsed, status samples that found a packet
++//! waiting, the driver's send sequence number and limit, and the raw credit byte from the
++//! firmware's packet headers.
++
++#![no_std]
++#![no_main]
++
++use cyw43::aligned_bytes;
++use cyw43_pio::{PioSpi, RM2_CLOCK_DIVIDER};
++use defmt::*;
++use defmt_rtt as _;
++use embassy_executor::Spawner;
++use embassy_rp::gpio::{Level, Output};
++use embassy_rp::peripherals::{DMA_CH0, DMA_CH1, PIO0};
++use embassy_rp::pio::{InterruptHandler, Pio};
++use embassy_rp::{bind_interrupts, dma};
++use embassy_time::Timer;
++use panic_probe as _;
++use static_cell::StaticCell;
++
++bind_interrupts!(struct Irqs {
++    PIO0_IRQ_0 => InterruptHandler<PIO0>;
++    DMA_IRQ_0 => dma::InterruptHandler<DMA_CH0>, dma::InterruptHandler<DMA_CH1>;
++});
++
++#[embassy_executor::task]
++async fn cyw43_task(
++    runner: cyw43::Runner<'static, cyw43::SpiBus<Output<'static>, PioSpi<'static, PIO0, 0>>, cyw43::Cyw43439>,
++) -> ! {
++    runner.run().await
++}
++
++/// Value for `bsscfg:p2p_state`: config index, state (0 scan, 1 listen), pad, chanspec, dwell ms.
++fn p2p_state(idx: u32, state: u8, chanspec: u16, dwell_ms: u16) -> [u8; 10] {
++    let mut v = [0u8; 10];
++    v[..4].copy_from_slice(&idx.to_le_bytes());
++    v[4] = state;
++    v[6..8].copy_from_slice(&chanspec.to_le_bytes());
++    v[8..10].copy_from_slice(&dwell_ms.to_le_bytes());
++    v
++}
++
++fn report(name: &str) {
++    let rx = cyw43::diag_rx_take();
++    let b = cyw43::diag_bus_take();
++    info!(
++        "{}: frames {} | pkts {} unparsed {} | samples {} avail {} irqs {} | seq {} max {} nocredit {} txstall {} | credit last {} min {} max {} seen {}",
++        name,
++        rx.frames,
++        b.pkts,
++        b.parse_fail,
++        b.samples,
++        b.avail,
++        b.irqs,
++        b.seq,
++        b.seq_max,
++        b.no_credit,
++        b.tx_stalled,
++        b.credit_last,
++        b.credit_min,
++        b.credit_max,
++        b.credit_seen
++    );
++}
++
++#[embassy_executor::main(executor = "embassy_rp::executor::Executor", entry = "cortex_m_rt::entry")]
++async fn main(spawner: Spawner) {
++    let p = embassy_rp::init(Default::default());
++    let variant = option_env!("VARIANT").unwrap_or("base");
++    match variant {
++        "wm16" => cyw43::diag_experiment(0x10, false, false),
++        "wm64" => cyw43::diag_experiment(0x40, false, false),
++        "ack" => cyw43::diag_experiment(0, true, false),
++        "poke" => cyw43::diag_experiment(0, false, true),
++        _ => cyw43::diag_experiment(0, false, false),
++    }
++    info!("variant: {}", variant);
++    let fw = aligned_bytes!("../../../../cyw43-firmware/43439A0.bin");
++    let clm = aligned_bytes!("../../../../cyw43-firmware/43439A0_clm.bin");
++    let nvram = aligned_bytes!("../../../../cyw43-firmware/nvram_rp2040.bin");
++
++    let pwr = Output::new(p.PIN_23, Level::Low);
++    let cs = Output::new(p.PIN_25, Level::High);
++    let mut pio = Pio::new(p.PIO0, Irqs);
++    let spi = PioSpi::new(
++        &mut pio.common,
++        pio.sm0,
++        RM2_CLOCK_DIVIDER,
++        pio.irq0,
++        cs,
++        p.PIN_24,
++        p.PIN_29,
++        dma::Channel::new(p.DMA_CH0, Irqs),
++        dma::Channel::new(p.DMA_CH1, Irqs),
++    );
++
++    static STATE: StaticCell<cyw43::State> = StaticCell::new();
++    let state = STATE.init(cyw43::State::new());
++    let (_net_device, mut control, runner) = cyw43::new(state, pwr, spi, fw, nvram).await;
++    spawner.spawn(unwrap!(cyw43_task(runner)));
++    control.init(clm, cyw43::Config::default()).await;
++
++    cyw43::diag_bus_config(100, false);
++    let _ = cyw43::diag_bus_take();
++    Timer::after_secs(2).await;
++    report("baseline-2s");
++
++    let mut addr = control.address().await;
++    addr[0] |= 0x02;
++    let _ = control.diag_set_iovar("p2p_disc", &0u32.to_le_bytes()).await;
++    let _ = control.diag_set_iovar("p2p_da_override", &addr).await;
++    let s2 = control.diag_set_iovar("p2p_disc", &1u32.to_le_bytes()).await;
++    Timer::after_millis(500).await;
++    let mut res = [0u8; 16];
++    let (s3, _) = control.diag_get_iovar("p2p_dev", &mut res).await;
++    let idx = u32::from_le_bytes([res[0], res[1], res[2], res[3]]);
++    info!("p2p: disc1 {} p2p_dev {} index {}", s2, s3, idx);
++    let _ = control
++        .diag_set_iovar("bsscfg:p2p_state", &p2p_state(idx, 0, 0, 0))
++        .await;
++    let am = control.diag_set_allmulti(true).await;
++    report("setup");
++    let (ms, _) = control.diag_monitor(Some(1)).await;
++    info!("monitor on: allmulti {} set {}", am, ms);
++    for name in ["on-w0", "on-w1"] {
++        for _ in 0..3 {
++            let _ = control
++                .diag_set_iovar("bsscfg:p2p_state", &p2p_state(idx, 1, 0x1006, 5000))
++                .await;
++            Timer::after_millis(5200).await;
++        }
++        report(name);
++    }
++    let (m0, _) = control.diag_monitor(Some(0)).await;
++    Timer::after_millis(500).await;
++    info!("monitor off: {}", m0);
++    report("off-0.5s");
++    for _ in 0..3 {
++        let _ = control
++            .diag_set_iovar("bsscfg:p2p_state", &p2p_state(idx, 1, 0x1006, 5000))
++            .await;
++        Timer::after_millis(5200).await;
++    }
++    report("off-w3");
++    let _ = control.diag_set_allmulti(false).await;
++    let _ = control
++        .diag_set_iovar("bsscfg:p2p_state", &p2p_state(idx, 0, 0, 0))
++        .await;
++    let _ = control.diag_set_iovar("p2p_disc", &0u32.to_le_bytes()).await;
++    Timer::after_millis(500).await;
++    report("teardown");
++    info!("done");
++    loop {
++        Timer::after_secs(60).await;
++    }
++}
+-- 
+2.43.0
+

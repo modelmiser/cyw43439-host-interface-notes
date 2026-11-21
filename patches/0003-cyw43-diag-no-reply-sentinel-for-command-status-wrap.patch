@@ -1,0 +1,178 @@
+From 6a9ba60b48f645d47f6108d1e9f99e2bf067af0a Mon Sep 17 00:00:00 2001
+From: Chad Aldreda <ca@modelmiser.com>
+Date: Fri, 20 Nov 2026 14:20:33 -0800
+Subject: [PATCH 3/8] cyw43 diag: no-reply sentinel for command status,
+ wrapping kind counts, guarded signal range; example notes
+
+From the review panel of 2026-11-20. Not re-run on hardware.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ cyw43/src/control.rs                          |  9 ++++++++-
+ cyw43/src/diag.rs                             | 20 +++++++++++++++----
+ cyw43/src/lib.rs                              |  3 ++-
+ .../rp235x/src/bin/wifi_interface_probe.rs    |  6 +++++-
+ 4 files changed, 31 insertions(+), 7 deletions(-)
+
+diff --git a/cyw43/src/control.rs b/cyw43/src/control.rs
+index 635d2cd68..344a2eb9c 100644
+--- a/cyw43/src/control.rs
++++ b/cyw43/src/control.rs
+@@ -746,8 +746,10 @@ impl<'a> Control<'a> {
+     }
+ 
+     /// Diagnostic: read a named variable. Returns the firmware's status for the command
+-    /// (0 = accepted) and the reply length; the reply is copied into `res`.
++    /// (0 = accepted, `DIAG_NO_REPLY` if none was recorded) and the reply length; the reply is
++    /// copied into `res`, which must not be longer than 64 bytes minus the name.
+     pub async fn diag_get_iovar(&mut self, name: &str, res: &mut [u8]) -> (i32, usize) {
++        crate::diag::LAST_IOCTL_STATUS.store(crate::diag::DIAG_NO_REPLY, core::sync::atomic::Ordering::Relaxed);
+         let len = self.get_iovar(name, res).await;
+         (
+             crate::diag::LAST_IOCTL_STATUS.load(core::sync::atomic::Ordering::Relaxed),
+@@ -758,6 +760,7 @@ impl<'a> Control<'a> {
+     /// Diagnostic: ask the firmware to send every event (all 24 mask bytes set), undoing the
+     /// ones `init` switches off. Returns the firmware's status.
+     pub async fn diag_enable_all_events(&mut self) -> i32 {
++        crate::diag::LAST_IOCTL_STATUS.store(crate::diag::DIAG_NO_REPLY, core::sync::atomic::Ordering::Relaxed);
+         let evts = EventMask {
+             iface: 0,
+             events: [0xFF; 24],
+@@ -769,6 +772,7 @@ impl<'a> Control<'a> {
+     /// Diagnostic: write a named variable (name + value at most 195 bytes). Returns the firmware's
+     /// status. For a `bsscfg:` name the caller puts the 4-byte index first in `val`.
+     pub async fn diag_set_iovar(&mut self, name: &str, val: &[u8]) -> i32 {
++        crate::diag::LAST_IOCTL_STATUS.store(crate::diag::DIAG_NO_REPLY, core::sync::atomic::Ordering::Relaxed);
+         self.set_iovar(name, val).await;
+         crate::diag::LAST_IOCTL_STATUS.load(core::sync::atomic::Ordering::Relaxed)
+     }
+@@ -776,6 +780,7 @@ impl<'a> Control<'a> {
+     /// Diagnostic: write (`Some`) or read (`None`) the promiscuous setting, commands 10 and 9.
+     /// Returns the firmware's status and, for a read, the value.
+     pub async fn diag_promisc(&mut self, set: Option<u32>) -> (i32, u32) {
++        crate::diag::LAST_IOCTL_STATUS.store(crate::diag::DIAG_NO_REPLY, core::sync::atomic::Ordering::Relaxed);
+         let mut buf = set.unwrap_or(0).to_le_bytes();
+         match set {
+             Some(_) => self.ioctl(IoctlType::Set, Ioctl::SetPromisc, 0, &mut buf).await,
+@@ -789,6 +794,7 @@ impl<'a> Control<'a> {
+ 
+     /// Diagnostic: set "allmulti". Returns the firmware's status.
+     pub async fn diag_set_allmulti(&mut self, on: bool) -> i32 {
++        crate::diag::LAST_IOCTL_STATUS.store(crate::diag::DIAG_NO_REPLY, core::sync::atomic::Ordering::Relaxed);
+         self.set_iovar_u32("allmulti", on as u32).await;
+         crate::diag::LAST_IOCTL_STATUS.load(core::sync::atomic::Ordering::Relaxed)
+     }
+@@ -796,6 +802,7 @@ impl<'a> Control<'a> {
+     /// Diagnostic: write (`Some`) or read (`None`) the monitor setting, commands 108 and 107.
+     /// Returns the firmware's status and, for a read, the value.
+     pub async fn diag_monitor(&mut self, set: Option<u32>) -> (i32, u32) {
++        crate::diag::LAST_IOCTL_STATUS.store(crate::diag::DIAG_NO_REPLY, core::sync::atomic::Ordering::Relaxed);
+         let mut buf = set.unwrap_or(0).to_le_bytes();
+         match set {
+             Some(_) => self.ioctl(IoctlType::Set, Ioctl::SetMonitor, 0, &mut buf).await,
+diff --git a/cyw43/src/diag.rs b/cyw43/src/diag.rs
+index ab7d0bb7c..3e6879950 100644
+--- a/cyw43/src/diag.rs
++++ b/cyw43/src/diag.rs
+@@ -13,8 +13,14 @@ pub const DIAG_HEAD: usize = 64;
+ /// Frames sampled per `diag_rx_take` interval (the first ones to arrive).
+ pub const DIAG_SAMPLES: usize = 8;
+ 
++/// Status of the last command reply. The `diag_*` calls set it to `DIAG_NO_REPLY` before sending,
++/// so a reply that never arrives (or one swallowed by the runner's own inline command) does not
++/// read as the previous command's status.
+ pub(crate) static LAST_IOCTL_STATUS: AtomicI32 = AtomicI32::new(0);
+ 
++/// Status value meaning "no reply to this command was recorded".
++pub const DIAG_NO_REPLY: i32 = i32::MIN;
++
+ /// What arrived on the data channel since the previous `diag_rx_take`.
+ #[derive(Clone, Copy)]
+ pub struct DiagRx {
+@@ -22,8 +28,9 @@ pub struct DiagRx {
+     pub frames: u32,
+     /// Their total length.
+     pub bytes: u32,
+-    /// Frames by `(first byte >> 2) & 0x3f`: the 802.11 type and subtype if the frame starts
+-    /// with an 802.11 frame-control field.
++    /// Frames by `(first byte >> 2) & 0x3f`, i.e. `subtype << 2 | type` if the frame starts with
++    /// an 802.11 frame-control field (0x20 beacon, 0x34 action, 0x10 probe request). All frames on
++    /// the data channel are counted, whatever they are.
+     pub kinds: [u32; 64],
+     /// How many of `heads` are filled.
+     pub samples: usize,
+@@ -54,7 +61,8 @@ pub(crate) fn rx_frame(packet: &[u8]) {
+         rx.frames = rx.frames.wrapping_add(1);
+         rx.bytes = rx.bytes.wrapping_add(packet.len() as u32);
+         if let Some(&b) = packet.first() {
+-            rx.kinds[((b >> 2) & 0x3f) as usize] += 1;
++            let k = ((b >> 2) & 0x3f) as usize;
++            rx.kinds[k] = rx.kinds[k].wrapping_add(1);
+         }
+         let i = rx.samples;
+         // At most two beacons among the samples, so other frame kinds are not crowded out.
+@@ -105,6 +113,8 @@ pub struct DiagEvents {
+     pub af_rssi_min: i32,
+     /// See `af_rssi_min`.
+     pub af_rssi_max: i32,
++    /// ACTION_FRAME_RX (75) events long enough to carry the 16-byte record.
++    pub af_seen: u32,
+ }
+ 
+ impl DiagEvents {
+@@ -121,6 +131,7 @@ impl DiagEvents {
+             af_last: 0,
+             af_rssi_min: 0,
+             af_rssi_max: 0,
++            af_seen: 0,
+         }
+     }
+ }
+@@ -134,11 +145,12 @@ pub(crate) fn event(code: u8, datalen: u32, addr: [u8; 6], data: &[u8]) {
+         if code == 75 && data.len() >= 16 {
+             let rssi = i32::from_be_bytes([data[4], data[5], data[6], data[7]]);
+             let mactime = u32::from_be_bytes([data[8], data[9], data[10], data[11]]);
+-            if ev.counts[75] == 1 {
++            if ev.af_seen == 0 {
+                 ev.af_first = mactime;
+                 ev.af_rssi_min = rssi;
+                 ev.af_rssi_max = rssi;
+             }
++            ev.af_seen += 1;
+             ev.af_last = mactime;
+             ev.af_rssi_min = ev.af_rssi_min.min(rssi);
+             ev.af_rssi_max = ev.af_rssi_max.max(rssi);
+diff --git a/cyw43/src/lib.rs b/cyw43/src/lib.rs
+index 83896f7b0..2208a9184 100644
+--- a/cyw43/src/lib.rs
++++ b/cyw43/src/lib.rs
+@@ -36,7 +36,8 @@ use ioctl::IoctlState;
+ 
+ pub use crate::control::{ApAuth, Config, Control, JoinAuth, JoinError, JoinOptions, ScanOptions, ScanType, Scanner};
+ pub use crate::diag::{
+-    DIAG_EV_SAMPLED, DIAG_EV_SAMPLES, DIAG_HEAD, DIAG_SAMPLES, DiagEvents, DiagRx, diag_events_take, diag_rx_take,
++    DIAG_EV_SAMPLED, DIAG_EV_SAMPLES, DIAG_HEAD, DIAG_NO_REPLY, DIAG_SAMPLES, DiagEvents, DiagRx, diag_events_take,
++    diag_rx_take,
+ };
+ pub use crate::runner::Runner;
+ pub use crate::sdio::SdioBus;
+diff --git a/examples/rp235x/src/bin/wifi_interface_probe.rs b/examples/rp235x/src/bin/wifi_interface_probe.rs
+index 6f6504f65..d21090254 100644
+--- a/examples/rp235x/src/bin/wifi_interface_probe.rs
++++ b/examples/rp235x/src/bin/wifi_interface_probe.rs
+@@ -7,7 +7,11 @@
+ //! 4. switches monitor mode on for 15 s and prints what arrived on the data channel;
+ //! 5. switches everything off again and then prints an event census every 10 s.
+ //!
+-//! Monitor mode and scanning exclude each other, so nothing scans while monitor is on.
++//! Monitor is switched on before the first listen dwell and the frame counter is cleared after
++//! that, so the count is for the three dwells (about 15.6 s). Nothing scans while monitor is on.
++//! The board settings file is the one embassy ships for the Pico W (`nvram_rp2040.bin`); the
++//! Pico 2 W example upstream uses the same. The `firmware-logs` feature of this examples crate
++//! is on, so the firmware's own text log appears at debug level.
+ //! Received frames identify other people's devices: mind what you log and keep.
+ 
+ #![no_std]
+-- 
+2.43.0
+

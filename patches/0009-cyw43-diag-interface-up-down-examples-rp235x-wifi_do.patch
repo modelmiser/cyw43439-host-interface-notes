@@ -1,0 +1,217 @@
+From d20b70f6da3935fd6af2caaf6825b2660d81206f Mon Sep 17 00:00:00 2001
+From: Chad Aldreda <ca@modelmiser.com>
+Date: Fri, 20 Nov 2026 18:50:44 -0800
+Subject: [PATCH] =?UTF-8?q?cyw43=20diag:=20interface=20up/down;=20examples?=
+ =?UTF-8?q?/rp235x:=20wifi=5Fdownup=20=E2=80=94=20pool=20loss=20without=20?=
+ =?UTF-8?q?P2P,=20and=20across=20WLC=5FDOWN/UP?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Run on a Pico 2 W (2026-11-21).
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ cyw43/src/control.rs                   |   8 ++
+ examples/rp235x/src/bin/wifi_downup.rs | 170 +++++++++++++++++++++++++
+ 2 files changed, 178 insertions(+)
+ create mode 100644 examples/rp235x/src/bin/wifi_downup.rs
+
+diff --git a/cyw43/src/control.rs b/cyw43/src/control.rs
+index 970eb428e..55f677fed 100644
+--- a/cyw43/src/control.rs
++++ b/cyw43/src/control.rs
+@@ -783,6 +783,14 @@ impl<'a> Control<'a> {
+         )
+     }
+ 
++    /// Diagnostic: send the interface Up (command 2) or Down (command 3). Returns the firmware's status.
++    pub async fn diag_updown(&mut self, up: bool) -> i32 {
++        crate::diag::LAST_IOCTL_STATUS.store(crate::diag::DIAG_NO_REPLY, core::sync::atomic::Ordering::Relaxed);
++        let cmd = if up { Ioctl::Up } else { Ioctl::Down };
++        self.ioctl(IoctlType::Set, cmd, 0, &mut []).await;
++        crate::diag::LAST_IOCTL_STATUS.load(core::sync::atomic::Ordering::Relaxed)
++    }
++
+     /// Diagnostic: write a named variable (name + value at most 195 bytes). Returns the firmware's
+     /// status. For a `bsscfg:` name the caller puts the 4-byte index first in `val`.
+     pub async fn diag_set_iovar(&mut self, name: &str, val: &[u8]) -> i32 {
+diff --git a/examples/rp235x/src/bin/wifi_downup.rs b/examples/rp235x/src/bin/wifi_downup.rs
+new file mode 100644
+index 000000000..702b27509
+--- /dev/null
++++ b/examples/rp235x/src/bin/wifi_downup.rs
+@@ -0,0 +1,170 @@
++//! Two checks for the monitor-mode packet-pool loss, without any Wi-Fi Direct (P2P) state and
++//! without Bluetooth: (1) the firmware's "memuse" line before and after monitor mode with the
++//! radio left idle; (2) whether taking the interface Down and Up returns the pool, and whether a
++//! second monitor session then delivers a fresh burst.
++
++#![no_std]
++#![no_main]
++
++use cyw43::aligned_bytes;
++use cyw43_pio::{PioSpi, RM2_CLOCK_DIVIDER};
++use defmt::*;
++use defmt_rtt as _;
++use embassy_executor::Spawner;
++use embassy_rp::gpio::{Level, Output};
++use embassy_rp::peripherals::{DMA_CH0, DMA_CH1, PIO0};
++use embassy_rp::pio::{InterruptHandler, Pio};
++use embassy_rp::{bind_interrupts, dma};
++use embassy_time::Timer;
++use panic_probe as _;
++use static_cell::StaticCell;
++
++bind_interrupts!(struct Irqs {
++    PIO0_IRQ_0 => InterruptHandler<PIO0>;
++    DMA_IRQ_0 => dma::InterruptHandler<DMA_CH0>, dma::InterruptHandler<DMA_CH1>;
++});
++
++#[embassy_executor::task]
++async fn cyw43_task(
++    runner: cyw43::Runner<'static, cyw43::SpiBus<Output<'static>, PioSpi<'static, PIO0, 0>>, cyw43::Cyw43439>,
++) -> ! {
++    runner.run().await
++}
++
++/// Value for `bsscfg:p2p_state`: config index, state (0 scan, 1 listen), pad, chanspec, dwell ms.
++fn p2p_state(idx: u32, state: u8, chanspec: u16, dwell_ms: u16) -> [u8; 10] {
++    let mut v = [0u8; 10];
++    v[..4].copy_from_slice(&idx.to_le_bytes());
++    v[4] = state;
++    v[6..8].copy_from_slice(&chanspec.to_le_bytes());
++    v[8..10].copy_from_slice(&dwell_ms.to_le_bytes());
++    v
++}
++
++async fn gauge(control: &mut cyw43::Control<'static>, name: &str) {
++    static mut BUF: [u8; 512] = [0; 512];
++    // SAFETY: single task, used sequentially.
++    #[allow(static_mut_refs)]
++    let buf = unsafe { &mut BUF };
++    let (status, len) = control.diag_get_iovar_buf("memuse", &mut buf[..]).await;
++    let end = len.min(512);
++    let n = buf[..end].iter().position(|c| *c == 0 || *c == b'\n').unwrap_or(end);
++    let b = cyw43::diag_bus_take();
++    info!(
++        "{}: memuse status {} [{=[u8]:a}] | seq {} max {} credit last {}",
++        name,
++        status,
++        buf[..n],
++        b.seq,
++        b.seq_max,
++        b.credit_last
++    );
++}
++
++fn report(name: &str) {
++    let rx = cyw43::diag_rx_take();
++    let b = cyw43::diag_bus_take();
++    info!(
++        "{}: frames {} | pkts {} unparsed {} | samples {} avail {} irqs {} | seq {} max {} nocredit {} txstall {} | credit last {} min {} max {} seen {}",
++        name,
++        rx.frames,
++        b.pkts,
++        b.parse_fail,
++        b.samples,
++        b.avail,
++        b.irqs,
++        b.seq,
++        b.seq_max,
++        b.no_credit,
++        b.tx_stalled,
++        b.credit_last,
++        b.credit_min,
++        b.credit_max,
++        b.credit_seen
++    );
++}
++
++#[embassy_executor::main(executor = "embassy_rp::executor::Executor", entry = "cortex_m_rt::entry")]
++async fn main(spawner: Spawner) {
++    let p = embassy_rp::init(Default::default());
++    let fw = aligned_bytes!("../../../../cyw43-firmware/43439A0.bin");
++    let clm = aligned_bytes!("../../../../cyw43-firmware/43439A0_clm.bin");
++    let nvram = aligned_bytes!("../../../../cyw43-firmware/nvram_rp2040.bin");
++
++    let pwr = Output::new(p.PIN_23, Level::Low);
++    let cs = Output::new(p.PIN_25, Level::High);
++    let mut pio = Pio::new(p.PIO0, Irqs);
++    let spi = PioSpi::new(
++        &mut pio.common,
++        pio.sm0,
++        RM2_CLOCK_DIVIDER,
++        pio.irq0,
++        cs,
++        p.PIN_24,
++        p.PIN_29,
++        dma::Channel::new(p.DMA_CH0, Irqs),
++        dma::Channel::new(p.DMA_CH1, Irqs),
++    );
++
++    static STATE: StaticCell<cyw43::State> = StaticCell::new();
++    let state = STATE.init(cyw43::State::new());
++    let (_net_device, mut control, runner) = cyw43::new(state, pwr, spi, fw, nvram).await;
++    spawner.spawn(unwrap!(cyw43_task(runner)));
++    control.init(clm, cyw43::Config::default()).await;
++
++    cyw43::diag_bus_config(100, false);
++    let _ = cyw43::diag_bus_take();
++    Timer::after_secs(2).await;
++    gauge(&mut control, "start (no P2P)").await;
++    let am = control.diag_set_allmulti(true).await;
++    gauge(&mut control, "allmulti on").await;
++    let (ms, _) = control.diag_monitor(Some(1)).await;
++    let _ = cyw43::diag_rx_take();
++    Timer::after_secs(15).await;
++    let rx = cyw43::diag_rx_take();
++    info!(
++        "monitor on (allmulti {} set {}), no commands for 15 s -> frames: {}",
++        am, ms, rx.frames
++    );
++    gauge(&mut control, "monitor on, after 15 s").await;
++    let (m0, _) = control.diag_monitor(Some(0)).await;
++    let am = control.diag_set_allmulti(false).await;
++    Timer::after_millis(1000).await;
++    info!("monitor off {} allmulti off {}", m0, am);
++    gauge(&mut control, "after monitor off").await;
++    let d = control.diag_updown(false).await;
++    Timer::after_millis(1000).await;
++    info!("WLC_DOWN: {}", d);
++    gauge(&mut control, "while down").await;
++    let u = control.diag_updown(true).await;
++    Timer::after_millis(1000).await;
++    info!("WLC_UP: {}", u);
++    gauge(&mut control, "after down/up").await;
++    let am = control.diag_set_allmulti(true).await;
++    let (ms, _) = control.diag_monitor(Some(1)).await;
++    let _ = cyw43::diag_rx_take();
++    Timer::after_secs(10).await;
++    let rx = cyw43::diag_rx_take();
++    info!(
++        "second monitor session (allmulti {} set {}), 10 s -> frames: {}",
++        am, ms, rx.frames
++    );
++    gauge(&mut control, "second session, after 10 s").await;
++    let (m0, _) = control.diag_monitor(Some(0)).await;
++    let _ = control.diag_set_allmulti(false).await;
++    Timer::after_millis(500).await;
++    info!("monitor off {}", m0);
++    let mut n = 0u32;
++    {
++        let mut scanner = control.scan(Default::default()).await;
++        while scanner.next().await.is_some() {
++            n += 1;
++        }
++    }
++    info!("scan results: {}", n);
++    gauge(&mut control, "end").await;
++    info!("done");
++    loop {
++        Timer::after_secs(60).await;
++    }
++}
+-- 
+2.43.0
+

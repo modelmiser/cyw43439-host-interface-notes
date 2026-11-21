@@ -1,0 +1,328 @@
+From c36add8ad45525a4fccf27bf33169ee3f8de0e5a Mon Sep 17 00:00:00 2001
+From: Chad Aldreda <ca@modelmiser.com>
+Date: Fri, 20 Nov 2026 12:13:38 -0800
+Subject: [PATCH 1/8] cyw43: diagnostics for exploring the firmware's host
+ interface
+
+Adds a small diag module: the status of the last command reply, counts and
+first bytes of frames received on the data channel, and a census of every
+event the firmware sends, taken before the driver filters events. Control
+gains diag_get_iovar, diag_set_iovar, diag_enable_all_events,
+diag_set_allmulti, diag_monitor and diag_promisc.
+
+Exploration aid, not proposed for upstream.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ cyw43/src/control.rs |  62 ++++++++++++++++
+ cyw43/src/diag.rs    | 166 +++++++++++++++++++++++++++++++++++++++++++
+ cyw43/src/lib.rs     |   4 ++
+ cyw43/src/runner.rs  |  10 +++
+ 4 files changed, 242 insertions(+)
+ create mode 100644 cyw43/src/diag.rs
+
+diff --git a/cyw43/src/control.rs b/cyw43/src/control.rs
+index 6be958270..635d2cd68 100644
+--- a/cyw43/src/control.rs
++++ b/cyw43/src/control.rs
+@@ -745,6 +745,68 @@ impl<'a> Control<'a> {
+         out_len
+     }
+ 
++    /// Diagnostic: read a named variable. Returns the firmware's status for the command
++    /// (0 = accepted) and the reply length; the reply is copied into `res`.
++    pub async fn diag_get_iovar(&mut self, name: &str, res: &mut [u8]) -> (i32, usize) {
++        let len = self.get_iovar(name, res).await;
++        (
++            crate::diag::LAST_IOCTL_STATUS.load(core::sync::atomic::Ordering::Relaxed),
++            len,
++        )
++    }
++
++    /// Diagnostic: ask the firmware to send every event (all 24 mask bytes set), undoing the
++    /// ones `init` switches off. Returns the firmware's status.
++    pub async fn diag_enable_all_events(&mut self) -> i32 {
++        let evts = EventMask {
++            iface: 0,
++            events: [0xFF; 24],
++        };
++        self.set_iovar("bsscfg:event_msgs", evts.to_bytes()).await;
++        crate::diag::LAST_IOCTL_STATUS.load(core::sync::atomic::Ordering::Relaxed)
++    }
++
++    /// Diagnostic: write a named variable (name + value at most 195 bytes). Returns the firmware's
++    /// status. For a `bsscfg:` name the caller puts the 4-byte index first in `val`.
++    pub async fn diag_set_iovar(&mut self, name: &str, val: &[u8]) -> i32 {
++        self.set_iovar(name, val).await;
++        crate::diag::LAST_IOCTL_STATUS.load(core::sync::atomic::Ordering::Relaxed)
++    }
++
++    /// Diagnostic: write (`Some`) or read (`None`) the promiscuous setting, commands 10 and 9.
++    /// Returns the firmware's status and, for a read, the value.
++    pub async fn diag_promisc(&mut self, set: Option<u32>) -> (i32, u32) {
++        let mut buf = set.unwrap_or(0).to_le_bytes();
++        match set {
++            Some(_) => self.ioctl(IoctlType::Set, Ioctl::SetPromisc, 0, &mut buf).await,
++            None => self.ioctl(IoctlType::Get, Ioctl::GetPromisc, 0, &mut buf).await,
++        };
++        (
++            crate::diag::LAST_IOCTL_STATUS.load(core::sync::atomic::Ordering::Relaxed),
++            u32::from_le_bytes(buf),
++        )
++    }
++
++    /// Diagnostic: set "allmulti". Returns the firmware's status.
++    pub async fn diag_set_allmulti(&mut self, on: bool) -> i32 {
++        self.set_iovar_u32("allmulti", on as u32).await;
++        crate::diag::LAST_IOCTL_STATUS.load(core::sync::atomic::Ordering::Relaxed)
++    }
++
++    /// Diagnostic: write (`Some`) or read (`None`) the monitor setting, commands 108 and 107.
++    /// Returns the firmware's status and, for a read, the value.
++    pub async fn diag_monitor(&mut self, set: Option<u32>) -> (i32, u32) {
++        let mut buf = set.unwrap_or(0).to_le_bytes();
++        match set {
++            Some(_) => self.ioctl(IoctlType::Set, Ioctl::SetMonitor, 0, &mut buf).await,
++            None => self.ioctl(IoctlType::Get, Ioctl::GetMonitor, 0, &mut buf).await,
++        };
++        (
++            crate::diag::LAST_IOCTL_STATUS.load(core::sync::atomic::Ordering::Relaxed),
++            u32::from_le_bytes(buf),
++        )
++    }
++
+     async fn ioctl_set_u32(&mut self, cmd: Ioctl, iface: u32, val: u32) {
+         let mut buf = val.to_le_bytes();
+         self.ioctl(IoctlType::Set, cmd, iface, &mut buf).await;
+diff --git a/cyw43/src/diag.rs b/cyw43/src/diag.rs
+new file mode 100644
+index 000000000..ab7d0bb7c
+--- /dev/null
++++ b/cyw43/src/diag.rs
+@@ -0,0 +1,166 @@
++//! Diagnostics for exploring the firmware's host interface: the status of the last command
++//! reply, counts and first bytes of frames received on the data channel, and a census of every
++//! event the firmware sends (before the driver's own filtering). Not meant for production use.
++
++use core::cell::RefCell;
++use core::sync::atomic::AtomicI32;
++
++use embassy_sync::blocking_mutex::Mutex;
++use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
++
++/// Bytes kept from the start of each sampled frame.
++pub const DIAG_HEAD: usize = 64;
++/// Frames sampled per `diag_rx_take` interval (the first ones to arrive).
++pub const DIAG_SAMPLES: usize = 8;
++
++pub(crate) static LAST_IOCTL_STATUS: AtomicI32 = AtomicI32::new(0);
++
++/// What arrived on the data channel since the previous `diag_rx_take`.
++#[derive(Clone, Copy)]
++pub struct DiagRx {
++    /// Frames received.
++    pub frames: u32,
++    /// Their total length.
++    pub bytes: u32,
++    /// Frames by `(first byte >> 2) & 0x3f`: the 802.11 type and subtype if the frame starts
++    /// with an 802.11 frame-control field.
++    pub kinds: [u32; 64],
++    /// How many of `heads` are filled.
++    pub samples: usize,
++    /// Full length of each sampled frame.
++    pub lens: [u16; DIAG_SAMPLES],
++    /// The first `DIAG_HEAD` bytes of each sampled frame.
++    pub heads: [[u8; DIAG_HEAD]; DIAG_SAMPLES],
++}
++
++impl DiagRx {
++    const fn new() -> Self {
++        Self {
++            frames: 0,
++            bytes: 0,
++            kinds: [0; 64],
++            samples: 0,
++            lens: [0; DIAG_SAMPLES],
++            heads: [[0; DIAG_HEAD]; DIAG_SAMPLES],
++        }
++    }
++}
++
++static RX: Mutex<CriticalSectionRawMutex, RefCell<DiagRx>> = Mutex::new(RefCell::new(DiagRx::new()));
++
++pub(crate) fn rx_frame(packet: &[u8]) {
++    RX.lock(|rx| {
++        let mut rx = rx.borrow_mut();
++        rx.frames = rx.frames.wrapping_add(1);
++        rx.bytes = rx.bytes.wrapping_add(packet.len() as u32);
++        if let Some(&b) = packet.first() {
++            rx.kinds[((b >> 2) & 0x3f) as usize] += 1;
++        }
++        let i = rx.samples;
++        // At most two beacons among the samples, so other frame kinds are not crowded out.
++        let beacon = packet.first() == Some(&0x80);
++        let beacons = rx.heads[..i].iter().filter(|h| h[0] == 0x80).count();
++        if i < DIAG_SAMPLES && !(beacon && beacons >= 2) {
++            let n = packet.len().min(DIAG_HEAD);
++            rx.heads[i][..n].copy_from_slice(&packet[..n]);
++            rx.lens[i] = packet.len() as u16;
++            rx.samples = i + 1;
++        }
++    });
++}
++
++/// Take and reset the data-channel counters and samples.
++pub fn diag_rx_take() -> DiagRx {
++    RX.lock(|rx| rx.replace(DiagRx::new()))
++}
++
++/// Event samples kept per `diag_events_take` interval.
++pub const DIAG_EV_SAMPLES: usize = 16;
++/// Event codes whose data is sampled, at most two each per interval: the management-frame
++/// events, plus IF (54), P2P_DISC_LISTEN_COMPLETE (55) and ACTION_FRAME (59).
++pub const DIAG_EV_SAMPLED: [u8; 8] = [44, 54, 55, 59, 71, 72, 75, 137];
++
++/// Every event the firmware sent since the previous `diag_events_take`, subscribed or not.
++#[derive(Clone, Copy)]
++pub struct DiagEvents {
++    /// Events by code (low 8 bits of the event type).
++    pub counts: [u32; 256],
++    /// How many samples are filled.
++    pub samples: usize,
++    /// Event code of each sample.
++    pub codes: [u8; DIAG_EV_SAMPLES],
++    /// The event message's `datalen` for each sample.
++    pub lens: [u32; DIAG_EV_SAMPLES],
++    /// The event message's `addr` for each sample.
++    pub addrs: [[u8; 6]; DIAG_EV_SAMPLES],
++    /// The first `DIAG_HEAD` bytes of each sample's event data.
++    pub heads: [[u8; DIAG_HEAD]; DIAG_EV_SAMPLES],
++    /// Bytes of event data actually present for each sample (at most `DIAG_HEAD` are kept).
++    pub present: [u16; DIAG_EV_SAMPLES],
++    /// ACTION_FRAME_RX (75) events: `mactime` of the first and the last one in the interval.
++    pub af_first: u32,
++    /// See `af_first`.
++    pub af_last: u32,
++    /// ACTION_FRAME_RX (75) events: lowest and highest `rssi` in the interval.
++    pub af_rssi_min: i32,
++    /// See `af_rssi_min`.
++    pub af_rssi_max: i32,
++}
++
++impl DiagEvents {
++    const fn new() -> Self {
++        Self {
++            counts: [0; 256],
++            samples: 0,
++            codes: [0; DIAG_EV_SAMPLES],
++            lens: [0; DIAG_EV_SAMPLES],
++            addrs: [[0; 6]; DIAG_EV_SAMPLES],
++            heads: [[0; DIAG_HEAD]; DIAG_EV_SAMPLES],
++            present: [0; DIAG_EV_SAMPLES],
++            af_first: 0,
++            af_last: 0,
++            af_rssi_min: 0,
++            af_rssi_max: 0,
++        }
++    }
++}
++
++static EV: Mutex<CriticalSectionRawMutex, RefCell<DiagEvents>> = Mutex::new(RefCell::new(DiagEvents::new()));
++
++pub(crate) fn event(code: u8, datalen: u32, addr: [u8; 6], data: &[u8]) {
++    EV.lock(|ev| {
++        let mut ev = ev.borrow_mut();
++        ev.counts[code as usize] = ev.counts[code as usize].wrapping_add(1);
++        if code == 75 && data.len() >= 16 {
++            let rssi = i32::from_be_bytes([data[4], data[5], data[6], data[7]]);
++            let mactime = u32::from_be_bytes([data[8], data[9], data[10], data[11]]);
++            if ev.counts[75] == 1 {
++                ev.af_first = mactime;
++                ev.af_rssi_min = rssi;
++                ev.af_rssi_max = rssi;
++            }
++            ev.af_last = mactime;
++            ev.af_rssi_min = ev.af_rssi_min.min(rssi);
++            ev.af_rssi_max = ev.af_rssi_max.max(rssi);
++        }
++        if !DIAG_EV_SAMPLED.contains(&code) {
++            return;
++        }
++        let i = ev.samples;
++        let same = ev.codes[..i].iter().filter(|c| **c == code).count();
++        if i < DIAG_EV_SAMPLES && same < 2 {
++            let n = data.len().min(DIAG_HEAD);
++            ev.heads[i][..n].copy_from_slice(&data[..n]);
++            ev.present[i] = data.len() as u16;
++            ev.codes[i] = code;
++            ev.lens[i] = datalen;
++            ev.addrs[i] = addr;
++            ev.samples = i + 1;
++        }
++    });
++}
++
++/// Take and reset the event census.
++pub fn diag_events_take() -> DiagEvents {
++    EV.lock(|ev| ev.replace(DiagEvents::new()))
++}
+diff --git a/cyw43/src/lib.rs b/cyw43/src/lib.rs
+index e75767b40..83896f7b0 100644
+--- a/cyw43/src/lib.rs
++++ b/cyw43/src/lib.rs
+@@ -16,6 +16,7 @@ mod chip;
+ mod consts;
+ mod control;
+ pub mod countries;
++mod diag;
+ mod events;
+ mod ioctl;
+ mod runner;
+@@ -34,6 +35,9 @@ use events::Events;
+ use ioctl::IoctlState;
+ 
+ pub use crate::control::{ApAuth, Config, Control, JoinAuth, JoinError, JoinOptions, ScanOptions, ScanType, Scanner};
++pub use crate::diag::{
++    DIAG_EV_SAMPLED, DIAG_EV_SAMPLES, DIAG_HEAD, DIAG_SAMPLES, DiagEvents, DiagRx, diag_events_take, diag_rx_take,
++};
+ pub use crate::runner::Runner;
+ pub use crate::sdio::SdioBus;
+ pub use crate::spi::{SpiBus, SpiBusCyw43};
+diff --git a/cyw43/src/runner.rs b/cyw43/src/runner.rs
+index ee0c9fdec..9ddee98bd 100644
+--- a/cyw43/src/runner.rs
++++ b/cyw43/src/runner.rs
+@@ -1171,6 +1171,9 @@ impl<'a, BUS: Bus, CHIP: Chip> Runner<'a, BUS, CHIP> {
+                 trace!("    {:?}", cdc_header);
+ 
+                 if cdc_header.id == self.ioctl_id {
++                    if !self.inline_ioctl_pending {
++                        crate::diag::LAST_IOCTL_STATUS.store(cdc_header.status as i32, Relaxed);
++                    }
+                     if cdc_header.status != 0 {
+                         // TODO: propagate error instead
+                         warn!("IOCTL error {}", cdc_header.status as i32);
+@@ -1226,6 +1229,12 @@ impl<'a, BUS: Bus, CHIP: Chip> Runner<'a, BUS, CHIP> {
+                 }
+ 
+                 let event_type = Event::from(event_packet.msg.event_type as u8);
++                crate::diag::event(
++                    event_packet.msg.event_type as u8,
++                    event_packet.msg.datalen,
++                    event_packet.msg.addr,
++                    evt_data,
++                );
+                 let status = EStatus::from(event_packet.msg.status as u8);
+                 debug!(
+                     "=== EVENT {:?}: {:?} {:02x}",
+@@ -1354,6 +1363,7 @@ impl<'a, BUS: Bus, CHIP: Chip> Runner<'a, BUS, CHIP> {
+                     return None;
+                 };
+                 trace!("rx pkt {:02x}", Bytes(&packet[..packet.len().min(48)]));
++                crate::diag::rx_frame(packet);
+ 
+                 Some(Reception {
+                     len: packet.len(),
+-- 
+2.43.0
+
