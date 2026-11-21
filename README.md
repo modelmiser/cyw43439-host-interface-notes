@@ -23,6 +23,10 @@ The build tag quoted below is what the running firmware prints in its own log.
 | pico-sdk | `raspberrypi/pico-sdk`, `pico_cyw43_driver/cybt_shared_bus` | `079c6f390` |
 | nexmon | `seemoo-lab/nexmon`, `seemoo-lab/pico-nexmon` | master, November 2026 |
 
+**Reference.** The `reference/` folder holds a longer, source-only reference to the same interface: 18
+chapters on what the public drivers define and send, with a citation for each statement. It reports no
+board results; its own README covers its conventions and the licences of its sources.
+
 **Evidence labels.** Each claim carries one:
 
 - `[source]` — read in the named driver; not checked on hardware.
