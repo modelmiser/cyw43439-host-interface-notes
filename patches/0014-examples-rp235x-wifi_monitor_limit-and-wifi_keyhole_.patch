@@ -1,0 +1,811 @@
+From 2d677a91e7f3a53427f141300676b37e7dedd294 Mon Sep 17 00:00:00 2001
+From: Chad Aldreda <ca@modelmiser.com>
+Date: Sun, 22 Nov 2026 05:25:46 -0800
+Subject: [PATCH] =?UTF-8?q?examples/rp235x:=20wifi=5Fmonitor=5Flimit=20and?=
+ =?UTF-8?q?=20wifi=5Fkeyhole=5Fsweep=20=E2=80=94=20the=20monitor=20limit,?=
+ =?UTF-8?q?=20what=20moves=20it,=20and=20what=20the=20firmware=20reports?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ examples/rp235x/src/bin/wifi_keyhole_sweep.rs | 370 ++++++++++++++++
+ examples/rp235x/src/bin/wifi_monitor_limit.rs | 408 ++++++++++++++++++
+ 2 files changed, 778 insertions(+)
+ create mode 100644 examples/rp235x/src/bin/wifi_keyhole_sweep.rs
+ create mode 100644 examples/rp235x/src/bin/wifi_monitor_limit.rs
+
+diff --git a/examples/rp235x/src/bin/wifi_keyhole_sweep.rs b/examples/rp235x/src/bin/wifi_keyhole_sweep.rs
+new file mode 100644
+index 000000000..c72d96134
+--- /dev/null
++++ b/examples/rp235x/src/bin/wifi_keyhole_sweep.rs
+@@ -0,0 +1,370 @@
++//! What the firmware says about itself around the monitor stall, without Bluetooth: its own
++//! console log, and a sweep of named variables. (0) the console log so far. (1) every name in
++//! `NAMES` read once (status, length, first bytes). (2) for the names that answered, ten per
++//! monitor session on channel 11: read, monitor on, 1 s, read again, and report the 32-bit words
++//! that changed; the console log after each session. (3) the same without monitor mode for the
++//! names that changed, as the control. The radio is restarted in place after every session.
++//!
++//! `NAMES` is the list of named variables Infineon's public driver header defines (`IOVAR_STR_*`
++//! in wifi-host-driver), less those whose names say they act, clear, add, remove or hold keys.
++//! Only reads are made.
++
++#![no_std]
++#![no_main]
++
++use cyw43::aligned_bytes;
++use cyw43_pio::{PioSpi, RM2_CLOCK_DIVIDER};
++use defmt::*;
++use defmt_rtt as _;
++use embassy_executor::Spawner;
++use embassy_rp::gpio::{Level, Output};
++use embassy_rp::peripherals::{DMA_CH0, DMA_CH1, PIO0};
++use embassy_rp::pio::{InterruptHandler, Pio};
++use embassy_rp::{bind_interrupts, dma};
++use embassy_time::Timer;
++use panic_probe as _;
++use static_cell::StaticCell;
++
++bind_interrupts!(struct Irqs {
++    PIO0_IRQ_0 => InterruptHandler<PIO0>;
++    DMA_IRQ_0 => dma::InterruptHandler<DMA_CH0>, dma::InterruptHandler<DMA_CH1>;
++});
++
++#[embassy_executor::task]
++async fn cyw43_task(
++    runner: cyw43::Runner<'static, cyw43::SpiBus<Output<'static>, PioSpi<'static, PIO0, 0>>, cyw43::Cyw43439>,
++) -> ! {
++    runner.run().await
++}
++
++/// Set up the Wi-Fi Direct listen state on `chanspec` with a 60 s dwell, and allmulti.
++async fn park(control: &mut cyw43::Control<'static>, chanspec: u16) -> bool {
++    let mut addr = control.address().await;
++    addr[0] |= 0x02;
++    let _ = control.diag_set_iovar("p2p_disc", &0u32.to_le_bytes()).await;
++    let _ = control.diag_set_iovar("p2p_da_override", &addr).await;
++    let s2 = control.diag_set_iovar("p2p_disc", &1u32.to_le_bytes()).await;
++    Timer::after_millis(500).await;
++    let mut res = [0u8; 16];
++    let (s3, _) = control.diag_get_iovar("p2p_dev", &mut res).await;
++    let idx = u32::from_le_bytes([res[0], res[1], res[2], res[3]]);
++    if s2 != 0 || s3 != 0 || idx > 15 {
++        warn!("listen setup failed: disc1 {} p2p_dev {} idx {}", s2, s3, idx);
++        return false;
++    }
++    let mut v = [0u8; 10];
++    v[..4].copy_from_slice(&idx.to_le_bytes());
++    let _ = control.diag_set_iovar("bsscfg:p2p_state", &v).await;
++    let _ = control.diag_set_allmulti(true).await;
++    v[4] = 1;
++    v[6..8].copy_from_slice(&chanspec.to_le_bytes());
++    v[8..10].copy_from_slice(&60000u16.to_le_bytes());
++    control.diag_set_iovar("bsscfg:p2p_state", &v).await == 0
++}
++
++/// Power-cycle the radio in place, load the firmware again and redo the Wi-Fi setup.
++async fn restart(
++    control: &mut cyw43::Control<'static>,
++    fw: &'static cyw43::Aligned<cyw43::A4, [u8]>,
++    nvram: &'static cyw43::Aligned<cyw43::A4, [u8]>,
++    clm: &[u8],
++) -> bool {
++    cyw43::diag_ignore_credit(false);
++    let _ = cyw43::diag_data_sent();
++    let (done, failed, _) = cyw43::diag_restart_result();
++    cyw43::diag_request_restart(fw, nvram);
++    for _ in 0..1000 {
++        Timer::after_millis(20).await;
++        let (d, f, ms) = cyw43::diag_restart_result();
++        if f != failed {
++            warn!("restart FAILED after {} ms", ms);
++            return false;
++        }
++        if d != done {
++            control.init(clm, cyw43::Config::default()).await;
++            return true;
++        }
++    }
++    warn!("restart did not finish");
++    false
++}
++
++const NAMES: &[&str] = &[
++    "2g_mrate",
++    "2g_rate",
++    "IBSS_join_only",
++    "a_rate",
++    "allmulti",
++    "ampdu_ba_wsize",
++    "ampdu_hostreorder",
++    "ampdu_mpdu",
++    "ampdu_rx",
++    "ampdu_rx_factor",
++    "ampdu_tid",
++    "apsta",
++    "arp_hostip",
++    "arp_ol",
++    "arp_peerage",
++    "arp_stats",
++    "arp_version",
++    "arpoe",
++    "assoc_listen",
++    "auth_status",
++    "autocountry",
++    "bcn_li_bcn",
++    "bcn_li_dtim",
++    "bg_rate",
++    "bip",
++    "brcmapivtwo",
++    "bss_maxassoc",
++    "bss_rateset",
++    "btc_lescan_params",
++    "bus:txglom",
++    "bwte_gci_mask",
++    "cap",
++    "chanspec",
++    "clmload_status",
++    "clmver",
++    "closednet",
++    "counters",
++    "country",
++    "csi",
++    "cur_etheraddr",
++    "dutycycle_cck",
++    "dutycycle_ofdm",
++    "event_log_tag_control",
++    "event_msgs",
++    "event_msgs_ext",
++    "fbt_cap",
++    "fbtoverds",
++    "he",
++    "icmp_echo_req",
++    "intol40",
++    "ldpc_cap",
++    "ldpc_tx",
++    "maxassoc",
++    "mbo",
++    "mcast_list",
++    "memuse",
++    "mesh_filter",
++    "mesh_find",
++    "mesh_max_peers",
++    "mesh_peer",
++    "mesh_peer_status",
++    "mfp",
++    "mimo_bw_cap",
++    "mpc",
++    "ndoe",
++    "nmode",
++    "nphy_antsel",
++    "nrate",
++    "oce",
++    "offload_config",
++    "p2p_dev",
++    "p2p_disc",
++    "p2p_if",
++    "p2p_ip_addr",
++    "p2p_ssid",
++    "p2p_state",
++    "phyrate_dump",
++    "phyrate_log",
++    "phyrate_log_size",
++    "pkt_filter_enable",
++    "pkt_filter_list",
++    "pkt_filter_mode",
++    "pkt_filter_stats",
++    "pm2_sleep_ret",
++    "pm_limit",
++    "pspretend_retry_limit",
++    "pspretend_threshold",
++    "qtxpower",
++    "rmc_ackreq",
++    "rmc_role",
++    "rmc_stats",
++    "rmc_status",
++    "roam_off",
++    "roam_time_thresh",
++    "rrm",
++    "rrm_bcn_req",
++    "rrm_bcn_req_max_off_chan_time",
++    "rrm_bcn_req_thrtl_win",
++    "rrm_bcn_req_traff_meas_per",
++    "rrm_chload_req",
++    "rrm_frame_req",
++    "rrm_lm_req",
++    "rrm_nbr_list",
++    "rrm_nbr_req",
++    "rrm_noise_req",
++    "rrm_stat_req",
++    "sae_max_pwe_loop",
++    "sae_transition_mode",
++    "scan_assoc_time",
++    "scan_home_time",
++    "scan_nprobes",
++    "scan_passive_time",
++    "scan_unassoc_time",
++    "scanmac",
++    "sgi_rx",
++    "sgi_tx",
++    "ssid",
++    "sup_wpa",
++    "sup_wpa2_eapver",
++    "sup_wpa_tmo",
++    "swdiv_timeout",
++    "tlv",
++    "twt",
++    "ulp",
++    "ulp_host_intr_mode",
++    "ulp_wait",
++    "ver",
++    "vht_features",
++    "vndr_ie",
++    "wd_disable",
++    "wme_ac_sta",
++    "wnm",
++    "wnm_bsstrans_query",
++    "wnm_bsstrans_resp",
++    "wpa_auth",
++    "wsec",
++    "wsec_info",
++];
++const VAR: usize = 1040;
++const BATCH: usize = 10;
++/// Channel 11, 20 MHz, 2.4 GHz.
++const CH11: u16 = 0x100b;
++
++/// Print the firmware console text gathered since the last call.
++fn console(tag: &str) {
++    static mut TEXT: [u8; cyw43::DIAG_CONSOLE] = [0; cyw43::DIAG_CONSOLE];
++    // SAFETY: single task, used sequentially.
++    #[allow(static_mut_refs)]
++    let text = unsafe { &mut TEXT };
++    let (n, lost) = cyw43::diag_console_take(&mut text[..]);
++    let mut lines = 0u32;
++    for raw in text[..n].split(|c| *c == b'\n') {
++        if raw.is_empty() {
++            continue;
++        }
++        lines += 1;
++        info!("console {}: {=[u8]:a}", tag, raw[..raw.len().min(200)]);
++    }
++    info!("console {}: {} lines, {} dropped", tag, lines, lost);
++}
++
++#[embassy_executor::main(executor = "embassy_rp::executor::Executor", entry = "cortex_m_rt::entry")]
++async fn main(spawner: Spawner) {
++    let p = embassy_rp::init(Default::default());
++    let fw = aligned_bytes!("../../../../cyw43-firmware/43439A0.bin");
++    let clm = aligned_bytes!("../../../../cyw43-firmware/43439A0_clm.bin");
++    let nvram = aligned_bytes!("../../../../cyw43-firmware/nvram_rp2040.bin");
++
++    let pwr = Output::new(p.PIN_23, Level::Low);
++    let cs = Output::new(p.PIN_25, Level::High);
++    let mut pio = Pio::new(p.PIO0, Irqs);
++    let spi = PioSpi::new(
++        &mut pio.common,
++        pio.sm0,
++        RM2_CLOCK_DIVIDER,
++        pio.irq0,
++        cs,
++        p.PIN_24,
++        p.PIN_29,
++        dma::Channel::new(p.DMA_CH0, Irqs),
++        dma::Channel::new(p.DMA_CH1, Irqs),
++    );
++
++    static STATE: StaticCell<cyw43::State> = StaticCell::new();
++    let state = STATE.init(cyw43::State::new());
++    let (_net_device, mut control, runner) = cyw43::new(state, pwr, spi, fw, nvram).await;
++    spawner.spawn(unwrap!(cyw43_task(runner)));
++    control.init(clm, cyw43::Config::default()).await;
++
++    cyw43::diag_bus_config(20, false);
++    Timer::after_secs(2).await;
++    static mut A: [[u8; VAR]; BATCH] = [[0; VAR]; BATCH];
++    static mut B: [[u8; VAR]; BATCH] = [[0; VAR]; BATCH];
++    // SAFETY: single task, used sequentially.
++    #[allow(static_mut_refs)]
++    let (a, b) = unsafe { (&mut A, &mut B) };
++    let mut answered = [false; NAMES.len()];
++    let mut changed = [false; NAMES.len()];
++    console("boot");
++    for (i, name) in NAMES.iter().enumerate() {
++        let (status, len) = control.diag_get_iovar_buf(name, &mut a[0][..]).await;
++        answered[i] = status == 0;
++        info!("probe {} status {} len {} head {=[u8]:02x}", name, status, len, a[0][..len.min(24)]);
++        // Often, so the console capture does not fill: a rejected name costs two console lines.
++        if i % 16 == 15 {
++            console("probe");
++        }
++    }
++    console("after-probe");
++    for pass in 0..2 {
++        let monitor = pass == 0;
++        let tag = if monitor { "monitor" } else { "control" };
++        let mut next = 0usize;
++        loop {
++            let mut batch = [0usize; BATCH];
++            let mut count = 0;
++            while next < NAMES.len() && count < BATCH {
++                if (monitor && answered[next]) || (!monitor && changed[next]) {
++                    batch[count] = next;
++                    count += 1;
++                }
++                next += 1;
++            }
++            if count == 0 {
++                break;
++            }
++            if !park(&mut control, CH11).await {
++                return;
++            }
++            Timer::after_millis(300).await;
++            let mut lens = [0usize; BATCH];
++            for k in 0..count {
++                let (_, len) = control.diag_get_iovar_buf(NAMES[batch[k]], &mut a[k][..]).await;
++                lens[k] = len.min(VAR);
++            }
++            let _ = cyw43::diag_rx_take();
++            let mut ms = -1;
++            if monitor {
++                ms = control.diag_monitor(Some(1)).await.0;
++            }
++            Timer::after_millis(1000).await;
++            let rx = cyw43::diag_rx_take();
++            let mut statuses = [0i32; BATCH];
++            for k in 0..count {
++                let (status, _) = control.diag_get_iovar_buf(NAMES[batch[k]], &mut b[k][..]).await;
++                statuses[k] = status;
++            }
++            info!("session {}: monitor status {} burst frames {} names:", tag, ms, rx.frames);
++            for k in 0..count {
++                let name = NAMES[batch[k]];
++                let n = lens[k] & !3;
++                let mut diffs = 0u32;
++                for w in (0..n).step_by(4) {
++                    let x = u32::from_le_bytes([a[k][w], a[k][w + 1], a[k][w + 2], a[k][w + 3]]);
++                    let y = u32::from_le_bytes([b[k][w], b[k][w + 1], b[k][w + 2], b[k][w + 3]]);
++                    if x != y {
++                        diffs += 1;
++                        if diffs <= 40 {
++                            info!("  {} {} word at {}: {:x} -> {:x}", tag, name, w, x, y);
++                        }
++                    }
++                }
++                info!("  {} {}: status after {} len {} words changed {}", tag, name, statuses[k], lens[k], diffs);
++                if monitor && (diffs > 0 || statuses[k] != 0) {
++                    changed[batch[k]] = true;
++                }
++            }
++            console(tag);
++            if !restart(&mut control, fw, nvram, clm).await {
++                return;
++            }
++        }
++    }
++    info!("done");
++    loop {
++        Timer::after_secs(60).await;
++    }
++}
+diff --git a/examples/rp235x/src/bin/wifi_monitor_limit.rs b/examples/rp235x/src/bin/wifi_monitor_limit.rs
+new file mode 100644
+index 000000000..ea25bdeac
+--- /dev/null
++++ b/examples/rp235x/src/bin/wifi_monitor_limit.rs
+@@ -0,0 +1,408 @@
++//! The monitor-mode limit, measured without Bluetooth: how many frames a session delivers, what
++//! lets more out, and what the firmware's free-buffer figure does meanwhile. The radio is restarted
++//! in place after every round, so each round ("round" = one monitor session) starts from freshly
++//! loaded firmware. Parts, chosen by `PARTS`:
++//!
++//! 1. settings: `mpc` 0, SetMonitor values 2 and 3, against the plain sequence (no listen state);
++//! 2. the burst: ten rounds on channel 11, per-frame arrival time, first byte and length, and how
++//!    many frames carried the test transmitter's address (`tools/inject_test.py`);
++//! 3. the free-buffer figure read once at a set time after the monitor command;
++//! 4. host actions after the burst: none, small reads, small writes, large reads, data packets;
++//! 5. data packets sent past the frozen send limit (the driver told to ignore it);
++//! 6. the restart workaround with a pump of up to 16 data packets before each restart.
++//!
++//! The bus probe's timer runs at 20 ms throughout: it is what wakes the driver's task to pick up
++//! the data-packet and restart requests. Each wake reads two bus registers, except while the send
++//! credit is used up, when the task only wakes.
++//!
++//! No command here has a timeout apart from the one in part 5: if the firmware stops answering,
++//! the program waits. Reset the board.
++
++#![no_std]
++#![no_main]
++
++use cyw43::aligned_bytes;
++use cyw43_pio::{PioSpi, RM2_CLOCK_DIVIDER};
++use defmt::*;
++use defmt_rtt as _;
++use embassy_executor::Spawner;
++use embassy_rp::gpio::{Level, Output};
++use embassy_rp::peripherals::{DMA_CH0, DMA_CH1, PIO0};
++use embassy_rp::pio::{InterruptHandler, Pio};
++use embassy_rp::{bind_interrupts, dma};
++use embassy_futures::select::{Either, select};
++use embassy_time::{Instant, Timer};
++use panic_probe as _;
++use static_cell::StaticCell;
++
++bind_interrupts!(struct Irqs {
++    PIO0_IRQ_0 => InterruptHandler<PIO0>;
++    DMA_IRQ_0 => dma::InterruptHandler<DMA_CH0>, dma::InterruptHandler<DMA_CH1>;
++});
++
++#[embassy_executor::task]
++async fn cyw43_task(
++    runner: cyw43::Runner<'static, cyw43::SpiBus<Output<'static>, PioSpi<'static, PIO0, 0>>, cyw43::Cyw43439>,
++) -> ! {
++    runner.run().await
++}
++
++/// The "N" of the firmware's "Packet pool: N of M available" line, or -1.
++async fn pool(control: &mut cyw43::Control<'static>) -> i32 {
++    static mut BUF: [u8; 512] = [0; 512];
++    // SAFETY: single task, used sequentially.
++    #[allow(static_mut_refs)]
++    let buf = unsafe { &mut BUF };
++    let (status, len) = control.diag_get_iovar_buf("memuse", &mut buf[..]).await;
++    if status != 0 {
++        return -1;
++    }
++    let text = &buf[..len.min(512)];
++    let key = b"Packet pool: ";
++    let Some(at) = text.windows(key.len()).position(|w| w == key) else {
++        return -1;
++    };
++    let mut n = 0i32;
++    let mut any = false;
++    for c in &text[at + key.len()..] {
++        if c.is_ascii_digit() {
++            n = n * 10 + (*c - b'0') as i32;
++            any = true;
++        } else {
++            break;
++        }
++    }
++    if any { n } else { -1 }
++}
++
++/// Set up the Wi-Fi Direct listen state on `chanspec` with a 60 s dwell, and allmulti.
++async fn park(control: &mut cyw43::Control<'static>, chanspec: u16) -> bool {
++    let mut addr = control.address().await;
++    addr[0] |= 0x02;
++    let _ = control.diag_set_iovar("p2p_disc", &0u32.to_le_bytes()).await;
++    let _ = control.diag_set_iovar("p2p_da_override", &addr).await;
++    let s2 = control.diag_set_iovar("p2p_disc", &1u32.to_le_bytes()).await;
++    Timer::after_millis(500).await;
++    let mut res = [0u8; 16];
++    let (s3, _) = control.diag_get_iovar("p2p_dev", &mut res).await;
++    let idx = u32::from_le_bytes([res[0], res[1], res[2], res[3]]);
++    if s2 != 0 || s3 != 0 || idx > 15 {
++        warn!("listen setup failed: disc1 {} p2p_dev {} idx {}", s2, s3, idx);
++        return false;
++    }
++    let mut v = [0u8; 10];
++    v[..4].copy_from_slice(&idx.to_le_bytes());
++    let _ = control.diag_set_iovar("bsscfg:p2p_state", &v).await;
++    let _ = control.diag_set_allmulti(true).await;
++    v[4] = 1;
++    v[6..8].copy_from_slice(&chanspec.to_le_bytes());
++    v[8..10].copy_from_slice(&60000u16.to_le_bytes());
++    control.diag_set_iovar("bsscfg:p2p_state", &v).await == 0
++}
++
++/// Power-cycle the radio in place, load the firmware again and redo the Wi-Fi setup.
++async fn restart(
++    control: &mut cyw43::Control<'static>,
++    fw: &'static cyw43::Aligned<cyw43::A4, [u8]>,
++    nvram: &'static cyw43::Aligned<cyw43::A4, [u8]>,
++    clm: &[u8],
++) -> bool {
++    cyw43::diag_ignore_credit(false);
++    let _ = cyw43::diag_data_sent();
++    let (done, failed, _) = cyw43::diag_restart_result();
++    cyw43::diag_request_restart(fw, nvram);
++    for _ in 0..1000 {
++        Timer::after_millis(20).await;
++        let (d, f, ms) = cyw43::diag_restart_result();
++        if f != failed {
++            warn!("restart FAILED after {} ms", ms);
++            return false;
++        }
++        if d != done {
++            control.init(clm, cyw43::Config::default()).await;
++            return true;
++        }
++    }
++    warn!("restart did not finish");
++    false
++}
++
++/// Which parts to run (bit 0 = part 1 ... bit 5 = part 6).
++const PARTS: u32 = 0b111111;
++/// Channel 11, 20 MHz, 2.4 GHz.
++const CH11: u16 = 0x100b;
++
++#[embassy_executor::main(executor = "embassy_rp::executor::Executor", entry = "cortex_m_rt::entry")]
++async fn main(spawner: Spawner) {
++    let p = embassy_rp::init(Default::default());
++    let fw = aligned_bytes!("../../../../cyw43-firmware/43439A0.bin");
++    let clm = aligned_bytes!("../../../../cyw43-firmware/43439A0_clm.bin");
++    let nvram = aligned_bytes!("../../../../cyw43-firmware/nvram_rp2040.bin");
++
++    let pwr = Output::new(p.PIN_23, Level::Low);
++    let cs = Output::new(p.PIN_25, Level::High);
++    let mut pio = Pio::new(p.PIO0, Irqs);
++    let spi = PioSpi::new(
++        &mut pio.common,
++        pio.sm0,
++        RM2_CLOCK_DIVIDER,
++        pio.irq0,
++        cs,
++        p.PIN_24,
++        p.PIN_29,
++        dma::Channel::new(p.DMA_CH0, Irqs),
++        dma::Channel::new(p.DMA_CH1, Irqs),
++    );
++
++    static STATE: StaticCell<cyw43::State> = StaticCell::new();
++    let state = STATE.init(cyw43::State::new());
++    let (_net_device, mut control, runner) = cyw43::new(state, pwr, spi, fw, nvram).await;
++    spawner.spawn(unwrap!(cyw43_task(runner)));
++    control.init(clm, cyw43::Config::default()).await;
++
++    cyw43::diag_bus_config(20, false);
++    Timer::after_secs(2).await;
++
++    if PARTS & 1 != 0 {
++        // (name, mpc to set first, monitor value)
++        let rounds: [(&str, Option<u32>, u32); 6] = [
++            ("control", None, 1),
++            ("mpc0", Some(0), 1),
++            ("mon2", None, 2),
++            ("mon3", None, 3),
++            ("mpc0-mon3", Some(0), 3),
++            ("control-again", None, 1),
++        ];
++        for (name, mpc, value) in rounds {
++            let mut res = [0u8; 4];
++            let _ = control.diag_get_iovar("mpc", &mut res).await;
++            let mpc_was = u32::from_le_bytes(res);
++            let mut mpc_now = mpc_was;
++            if let Some(v) = mpc {
++                let _ = control.diag_set_iovar("mpc", &v.to_le_bytes()).await;
++                let mut res = [0u8; 4];
++                let _ = control.diag_get_iovar("mpc", &mut res).await;
++                mpc_now = u32::from_le_bytes(res);
++            }
++            let _ = control.diag_set_allmulti(true).await;
++            let before = pool(&mut control).await;
++            let (ms, _) = control.diag_monitor(Some(value)).await;
++            let _ = cyw43::diag_rx_take();
++            Timer::after_secs(8).await;
++            let a = cyw43::diag_rx_take();
++            let mid = pool(&mut control).await;
++            Timer::after_secs(8).await;
++            let b = cyw43::diag_rx_take();
++            let end = pool(&mut control).await;
++            let (_, readback) = control.diag_monitor(None).await;
++            info!(
++                "1 settings {}: mpc {} -> {} | monitor value {} status {} readback {} | pool {} -> {} -> {} | frames first 8 s {} next 8 s {} | first bytes {=[u8]:02x}",
++                name, mpc_was, mpc_now, value, ms, readback, before, mid, end, a.frames, b.frames,
++                a.firsts[..(a.frames as usize).min(8)]
++            );
++            if !restart(&mut control, fw, nvram, clm).await {
++                return;
++            }
++        }
++    }
++
++    if PARTS & 2 != 0 {
++        for round in 0..10 {
++            if !park(&mut control, CH11).await {
++                return;
++            }
++            let before = pool(&mut control).await;
++            Timer::after_millis(300).await;
++            let _ = cyw43::diag_rx_take();
++            let (ms, _) = control.diag_monitor(Some(1)).await;
++            Timer::after_millis(4000).await;
++            let (rs, _) = control.diag_monitor(None).await;
++            Timer::after_millis(4000).await;
++            let rx = cyw43::diag_rx_take();
++            let after = pool(&mut control).await;
++            let n = (rx.frames as usize).min(cyw43::DIAG_TIMES);
++            info!(
++                "2 burst round {}: monitor status {} (read at 4 s: {}) | pool {} -> {} | frames {} bytes {} from the test transmitter {} | times ms {} | first bytes {=[u8]:02x} | lengths {} | marked bits {=u64:x}",
++                round, ms, rs, before, after, rx.frames, rx.bytes, rx.marks, rx.times[..n], rx.firsts[..n], rx.sizes[..n], rx.marked
++            );
++            if !restart(&mut control, fw, nvram, clm).await {
++                return;
++            }
++        }
++    }
++
++    if PARTS & 4 != 0 {
++        for delay in [50u64, 100, 150, 200, 300, 400, 600, 1000, 2500] {
++            if !park(&mut control, CH11).await {
++                return;
++            }
++            let before = pool(&mut control).await;
++            Timer::after_millis(300).await;
++            let _ = cyw43::diag_rx_take();
++            let (ms, _) = control.diag_monitor(Some(1)).await;
++            let started = Instant::now();
++            Timer::after_millis(delay).await;
++            let early = cyw43::diag_rx_take();
++            let mid = pool(&mut control).await;
++            Timer::after_millis(3000u64.saturating_sub(started.elapsed().as_millis())).await;
++            let late = cyw43::diag_rx_take();
++            let end = pool(&mut control).await;
++            info!(
++                "3 pool, read {} ms after monitor-on (status {}): pool {} -> {} -> {} | frames before the read {} after {}",
++                delay, ms, before, mid, end, early.frames, late.frames
++            );
++            if !restart(&mut control, fw, nvram, clm).await {
++                return;
++            }
++        }
++    }
++
++    if PARTS & 8 != 0 {
++        let kinds: [(&str, u32); 6] = [
++            ("none", 0),
++            ("small-read", 5),
++            ("data-packet", 5),
++            ("small-write", 5),
++            ("large-read", 5),
++            ("data-packet-x10", 10),
++        ];
++        for rep in 0..2 {
++            for (k, (name, count)) in kinds.into_iter().enumerate() {
++                if !park(&mut control, CH11).await {
++                    return;
++                }
++                Timer::after_millis(300).await;
++                let _ = cyw43::diag_rx_take();
++                let _ = cyw43::diag_data_sent();
++                let (ms, _) = control.diag_monitor(Some(1)).await;
++                Timer::after_millis(1000).await;
++                let burst = cyw43::diag_rx_take();
++                let b0 = cyw43::diag_bus_take();
++                for _ in 0..count {
++                    match k {
++                        1 => {
++                            let _ = control.diag_monitor(None).await;
++                        }
++                        2 | 5 => cyw43::diag_send_data(1),
++                        3 => {
++                            let _ = control.diag_set_allmulti(true).await;
++                        }
++                        4 => {
++                            let _ = pool(&mut control).await;
++                        }
++                        _ => {}
++                    }
++                    Timer::after_millis(150).await;
++                }
++                if count == 0 {
++                    Timer::after_millis(750).await;
++                }
++                Timer::after_millis(800).await;
++                let extra = cyw43::diag_rx_take();
++                let b1 = cyw43::diag_bus_take();
++                let (sent, unsent) = cyw43::diag_data_sent();
++                info!(
++                    "4 actions rep {} {} x{} (monitor status {}): burst frames {} | frames during the actions {} | data packets sent {} unsent {} | seq/limit before {}/{} after {}/{}",
++                    rep, name, count, ms, burst.frames, extra.frames, sent, unsent, b0.seq, b0.seq_max, b1.seq, b1.seq_max
++                );
++                if !restart(&mut control, fw, nvram, clm).await {
++                    return;
++                }
++            }
++        }
++    }
++
++    if PARTS & 16 != 0 {
++        // (name, packets, gap in ms between requests; 0 = all queued at once)
++        let rounds: [(&str, u32, u64); 5] = [
++            ("60-at-20ms", 60, 20),
++            ("300-at-5ms", 300, 5),
++            ("1000-at-once", 1000, 0),
++            ("4000-at-5ms", 4000, 5),
++            ("none", 0, 0),
++        ];
++        for (name, packets, gap) in rounds {
++            if !park(&mut control, CH11).await {
++                return;
++            }
++            Timer::after_millis(300).await;
++            let _ = cyw43::diag_rx_take();
++            let _ = cyw43::diag_data_sent();
++            let (ms, _) = control.diag_monitor(Some(1)).await;
++            Timer::after_millis(1000).await;
++            let burst = cyw43::diag_rx_take();
++            let b0 = cyw43::diag_bus_take();
++            cyw43::diag_ignore_credit(true);
++            if gap == 0 {
++                cyw43::diag_send_data(packets);
++                Timer::after_millis(5000).await;
++            } else {
++                for _ in 0..packets {
++                    cyw43::diag_send_data(1);
++                    Timer::after_millis(gap).await;
++                }
++            }
++            if packets == 0 {
++                Timer::after_millis(2000).await;
++            }
++            Timer::after_millis(500).await;
++            let rx = cyw43::diag_rx_take();
++            let b1 = cyw43::diag_bus_take();
++            let (sent, unsent) = cyw43::diag_data_sent();
++            // A command now, still ignoring the limit: answered, or no reply within 3 s (-2)?
++            let after = match select(pool(&mut control), Timer::after_secs(3)).await {
++                Either::First(n) => n,
++                Either::Second(()) => -2,
++            };
++            cyw43::diag_ignore_credit(false);
++            info!(
++                "5 past the limit, {} (monitor status {}): burst {} | sent {} unsent {} | frames meanwhile {} | seq/limit before {}/{} after {}/{} | credit byte min {} max {} in {} headers | pool read after: {}",
++                name, ms, burst.frames, sent, unsent, rx.frames, b0.seq, b0.seq_max, b1.seq, b1.seq_max,
++                b1.credit_min, b1.credit_max, b1.credit_seen, after
++            );
++            if !restart(&mut control, fw, nvram, clm).await {
++                return;
++            }
++        }
++    }
++
++    if PARTS & 32 != 0 {
++        for round in 0..4 {
++            if !park(&mut control, CH11).await {
++                return;
++            }
++            let before = pool(&mut control).await;
++            Timer::after_millis(300).await;
++            let _ = cyw43::diag_rx_take();
++            let (ms, _) = control.diag_monitor(Some(1)).await;
++            Timer::after_millis(3000).await;
++            let window = cyw43::diag_rx_take();
++            let after = pool(&mut control).await;
++            Timer::after_millis(100).await;
++            let with_read = cyw43::diag_rx_take();
++            let _ = cyw43::diag_data_sent();
++            cyw43::diag_send_data(16);
++            Timer::after_millis(600).await;
++            let pumped = cyw43::diag_rx_take();
++            let (sent, unsent) = cyw43::diag_data_sent();
++            let started = Instant::now();
++            let ok = restart(&mut control, fw, nvram, clm).await;
++            let total = started.elapsed().as_millis();
++            let (_, _, chip_ms) = cyw43::diag_restart_result();
++            let again = pool(&mut control).await;
++            info!(
++                "6 pump round {} (monitor status {}): pool {} -> {} -> {} after restart | frames in 3 s {} + {} with the pool read + {} for {} packets sent ({} not sent) = {} | restart ok {} in {} ms, {} ms with the Wi-Fi setup",
++                round, ms, before, after, again, window.frames, with_read.frames, pumped.frames, sent, unsent,
++                window.frames + with_read.frames + pumped.frames, ok, chip_ms, total
++            );
++            if !ok {
++                return;
++            }
++        }
++    }
++
++    info!("done");
++    loop {
++        Timer::after_secs(60).await;
++    }
++}
+-- 
+2.43.0
+

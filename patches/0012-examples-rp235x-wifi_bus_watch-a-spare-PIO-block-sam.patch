@@ -1,0 +1,319 @@
+From a25f8f40203cf30f76f0ffc0a278bd74284b8157 Mon Sep 17 00:00:00 2001
+From: Chad Aldreda <ca@modelmiser.com>
+Date: Sun, 22 Nov 2026 04:34:52 -0800
+Subject: [PATCH] =?UTF-8?q?examples/rp235x:=20wifi=5Fbus=5Fwatch=20?=
+ =?UTF-8?q?=E2=80=94=20a=20spare=20PIO=20block=20samples=20the=20radio's?=
+ =?UTF-8?q?=20bus=20lines=20over=20one=20monitor=20session?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ examples/rp235x/src/bin/wifi_bus_watch.rs | 294 ++++++++++++++++++++++
+ 1 file changed, 294 insertions(+)
+ create mode 100644 examples/rp235x/src/bin/wifi_bus_watch.rs
+
+diff --git a/examples/rp235x/src/bin/wifi_bus_watch.rs b/examples/rp235x/src/bin/wifi_bus_watch.rs
+new file mode 100644
+index 000000000..96ae01d2f
+--- /dev/null
++++ b/examples/rp235x/src/bin/wifi_bus_watch.rs
+@@ -0,0 +1,294 @@
++//! A watch on the radio's own bus lines during one monitor session, without Bluetooth. A spare PIO
++//! block samples GPIO 24 (the gSPI data line, which the radio also raises as its interrupt while
++//! chip-select is idle), GPIO 25 (chip-select) and GPIO 26 (a marker this program pulses around its
++//! own commands) 250,000 times a second for 1.5 s, through DMA, while the driver uses the bus as
++//! usual. Sequence: listen state on channel 11, then at 100 ms monitor on, and at 900, 1100 and
++//! 1300 ms one small read command each. Afterwards it reports, for each stretch between marker
++//! pulses, how many bus transactions there were, how long the interrupt line was raised while the
++//! bus was idle, and how long the driver took to answer it.
++//!
++//! The sampler only reads the pins (its input base is set through the register, so the pins stay
++//! with the driver's PIO block); it drives nothing.
++
++#![no_std]
++#![no_main]
++
++use cyw43::aligned_bytes;
++use cyw43_pio::{PioSpi, RM2_CLOCK_DIVIDER};
++use defmt::*;
++use defmt_rtt as _;
++use embassy_executor::Spawner;
++use embassy_futures::join::join;
++use embassy_rp::gpio::{Level, Output};
++use embassy_rp::peripherals::{DMA_CH0, DMA_CH1, DMA_CH2, PIO0, PIO1};
++use embassy_rp::pio::program::pio_asm;
++use embassy_rp::pio::{Config, FifoJoin, InterruptHandler, Pio, ShiftConfig, ShiftDirection};
++use embassy_rp::{bind_interrupts, dma};
++use embassy_time::{Instant, Timer};
++use panic_probe as _;
++use static_cell::StaticCell;
++
++bind_interrupts!(struct Irqs {
++    PIO0_IRQ_0 => InterruptHandler<PIO0>;
++    PIO1_IRQ_0 => InterruptHandler<PIO1>;
++    DMA_IRQ_0 => dma::InterruptHandler<DMA_CH0>, dma::InterruptHandler<DMA_CH1>, dma::InterruptHandler<DMA_CH2>;
++});
++
++/// Samples per second, and words captured (8 samples of 4 bits per word): 1.5 s.
++const RATE: u32 = 250_000;
++const WORDS: usize = 46_875;
++/// Microseconds per sample.
++const US: u32 = 1_000_000 / RATE;
++
++#[embassy_executor::task]
++async fn cyw43_task(
++    runner: cyw43::Runner<'static, cyw43::SpiBus<Output<'static>, PioSpi<'static, PIO0, 0>>, cyw43::Cyw43439>,
++) -> ! {
++    runner.run().await
++}
++
++/// What happened between two marker pulses.
++#[derive(Clone, Copy, Default)]
++struct Stretch {
++    /// Start, in samples since the capture began.
++    start: u32,
++    samples: u32,
++    /// Chip-select went low this many times.
++    transactions: u32,
++    /// Samples with chip-select low.
++    busy: u32,
++    /// Samples with chip-select idle and the data line high (the radio's interrupt).
++    raised: u32,
++    /// Times the data line rose while chip-select was idle.
++    rises: u32,
++    /// Longest single stretch of "raised", in samples.
++    longest_raised: u32,
++    /// From an interrupt rise to the next chip-select fall: count, total, shortest, longest (samples).
++    answered: u32,
++    answer_total: u32,
++    answer_min: u32,
++    answer_max: u32,
++    /// From the start of the stretch to the first chip-select fall, and to the first interrupt rise
++    /// after that fall (samples; u32::MAX = none).
++    first_cs: u32,
++    first_rise_after: u32,
++}
++
++#[embassy_executor::main(executor = "embassy_rp::executor::Executor", entry = "cortex_m_rt::entry")]
++async fn main(spawner: Spawner) {
++    let p = embassy_rp::init(Default::default());
++    let fw = aligned_bytes!("../../../../cyw43-firmware/43439A0.bin");
++    let clm = aligned_bytes!("../../../../cyw43-firmware/43439A0_clm.bin");
++    let nvram = aligned_bytes!("../../../../cyw43-firmware/nvram_rp2040.bin");
++
++    let pwr = Output::new(p.PIN_23, Level::Low);
++    let cs = Output::new(p.PIN_25, Level::High);
++    let mut marker = Output::new(p.PIN_26, Level::Low);
++    let mut pio = Pio::new(p.PIO0, Irqs);
++    let spi = PioSpi::new(
++        &mut pio.common,
++        pio.sm0,
++        RM2_CLOCK_DIVIDER,
++        pio.irq0,
++        cs,
++        p.PIN_24,
++        p.PIN_29,
++        dma::Channel::new(p.DMA_CH0, Irqs),
++        dma::Channel::new(p.DMA_CH1, Irqs),
++    );
++
++    static STATE: StaticCell<cyw43::State> = StaticCell::new();
++    let state = STATE.init(cyw43::State::new());
++    let (_net_device, mut control, runner) = cyw43::new(state, pwr, spi, fw, nvram).await;
++    spawner.spawn(unwrap!(cyw43_task(runner)));
++    control.init(clm, cyw43::Config::default()).await;
++
++    // The sampler: one `in` per PIO clock, four pins from GPIO 24, 32 bits per word.
++    let Pio {
++        common: mut common1,
++        sm0: mut sampler,
++        ..
++    } = Pio::new(p.PIO1, Irqs);
++    let prg = pio_asm!(".wrap_target", "in pins, 4", ".wrap");
++    let mut cfg = Config::default();
++    cfg.use_program(&common1.load_program(&prg.program), &[]);
++    cfg.clock_divider_x256 = (150_000_000 / RATE) << 8;
++    cfg.shift_in = ShiftConfig {
++        auto_fill: true,
++        threshold: 32,
++        direction: ShiftDirection::Right,
++    };
++    cfg.fifo_join = FifoJoin::RxOnly;
++    sampler.set_config(&cfg);
++    // Input base 24, set directly so the pins keep their function (the driver's PIO block).
++    embassy_rp::pac::PIO1.sm(0).pinctrl().modify(|w| w.set_in_base(24));
++    let mut dma_ch = dma::Channel::new(p.DMA_CH2, Irqs);
++    static mut CAPTURE: [u32; WORDS] = [0; WORDS];
++    // SAFETY: used by this task only.
++    #[allow(static_mut_refs)]
++    let capture = unsafe { &mut CAPTURE };
++
++    // Listen state on channel 11 with a long dwell, so no further command is needed.
++    Timer::after_secs(2).await;
++    let mut addr = control.address().await;
++    addr[0] |= 0x02;
++    let _ = control.diag_set_iovar("p2p_disc", &0u32.to_le_bytes()).await;
++    let _ = control.diag_set_iovar("p2p_da_override", &addr).await;
++    let s2 = control.diag_set_iovar("p2p_disc", &1u32.to_le_bytes()).await;
++    Timer::after_millis(500).await;
++    let mut res = [0u8; 16];
++    let (s3, _) = control.diag_get_iovar("p2p_dev", &mut res).await;
++    let idx = u32::from_le_bytes([res[0], res[1], res[2], res[3]]);
++    info!("listen setup: disc1 {} p2p_dev {} idx {}", s2, s3, idx);
++    let mut v = [0u8; 10];
++    v[..4].copy_from_slice(&idx.to_le_bytes());
++    let _ = control.diag_set_iovar("bsscfg:p2p_state", &v).await;
++    let am = control.diag_set_allmulti(true).await;
++    v[4] = 1;
++    v[6..8].copy_from_slice(&0x100bu16.to_le_bytes());
++    v[8..10].copy_from_slice(&60000u16.to_le_bytes());
++    let ls = control.diag_set_iovar("bsscfg:p2p_state", &v).await;
++    info!("allmulti {} listen {}", am, ls);
++    Timer::after_millis(500).await;
++    let _ = cyw43::diag_rx_take();
++
++    sampler.restart();
++    sampler.clear_fifos();
++    let started = Instant::now();
++    sampler.set_enable(true);
++    let mut frames = [0u32; 5];
++    let sequence = async {
++        let at = |ms: u64| Timer::at(started + embassy_time::Duration::from_millis(ms));
++        at(100).await;
++        frames[0] = cyw43::diag_rx_take().frames;
++        marker.set_high();
++        let (ms, _) = control.diag_monitor(Some(1)).await;
++        marker.set_low();
++        for (k, when) in [900u64, 1100, 1300].into_iter().enumerate() {
++            at(when).await;
++            frames[k + 1] = cyw43::diag_rx_take().frames;
++            marker.set_high();
++            let _ = control.diag_monitor(None).await;
++            marker.set_low();
++        }
++        at(1480).await;
++        frames[4] = cyw43::diag_rx_take().frames;
++        ms
++    };
++    let (_, ms) = join(sampler.rx().dma_pull(&mut dma_ch, &mut capture[..], false), sequence).await;
++    sampler.set_enable(false);
++    info!(
++        "capture done in {} ms; monitor-on status {}; frames: before {} | burst and stall {} | after command 1: {} | 2: {} | 3: {}",
++        started.elapsed().as_millis(),
++        ms,
++        frames[0],
++        frames[1],
++        frames[2],
++        frames[3],
++        frames[4]
++    );
++
++    // Walk the samples. Bit 0 = data line, bit 1 = chip-select (low = busy), bit 2 = marker.
++    let mut stretches = [Stretch::default(); 6];
++    for s in stretches.iter_mut() {
++        s.answer_min = u32::MAX;
++        s.first_cs = u32::MAX;
++        s.first_rise_after = u32::MAX;
++    }
++    let mut cur = 0usize;
++    let mut prev = 0b0010u32; // idle, data low, marker low
++    let mut raised_run = 0u32;
++    let mut rise_at: Option<u32> = None;
++    // Per 10 ms: transactions, and samples with the interrupt raised.
++    const BIN: u32 = RATE / 100;
++    let mut bin_tx = [0u8; 150];
++    let mut bin_raised = [0u16; 150];
++    let mut n = 0u32;
++    for word in capture.iter() {
++        for k in 0..8 {
++            let x = (word >> (4 * k)) & 0xf;
++            let (data, idle, mark) = (x & 1 != 0, x & 2 != 0, x & 4 != 0);
++            let (pdata, pidle, pmark) = (prev & 1 != 0, prev & 2 != 0, prev & 4 != 0);
++            if mark && !pmark && cur + 1 < stretches.len() {
++                stretches[cur].longest_raised = stretches[cur].longest_raised.max(raised_run);
++                raised_run = 0;
++                rise_at = None;
++                cur += 1;
++                stretches[cur].start = n;
++            }
++            let s = &mut stretches[cur];
++            let bin = ((n / BIN) as usize).min(149);
++            s.samples += 1;
++            if !idle {
++                s.busy += 1;
++                if pidle {
++                    s.transactions += 1;
++                    bin_tx[bin] = bin_tx[bin].saturating_add(1);
++                    if s.first_cs == u32::MAX {
++                        s.first_cs = n - s.start;
++                    }
++                    if let Some(at) = rise_at.take() {
++                        let d = n - at;
++                        s.answered += 1;
++                        s.answer_total += d;
++                        s.answer_min = s.answer_min.min(d);
++                        s.answer_max = s.answer_max.max(d);
++                    }
++                }
++                s.longest_raised = s.longest_raised.max(raised_run);
++                raised_run = 0;
++            } else if data {
++                s.raised += 1;
++                bin_raised[bin] = bin_raised[bin].saturating_add(1);
++                raised_run += 1;
++                if !(pidle && pdata) {
++                    s.rises += 1;
++                    rise_at = Some(n);
++                    if s.first_cs != u32::MAX && s.first_rise_after == u32::MAX {
++                        s.first_rise_after = n - s.start;
++                    }
++                }
++            } else {
++                s.longest_raised = s.longest_raised.max(raised_run);
++                raised_run = 0;
++            }
++            prev = x;
++            n += 1;
++        }
++    }
++    stretches[cur].longest_raised = stretches[cur].longest_raised.max(raised_run);
++    let names = ["before monitor", "monitor-on to command 1", "command 1 to 2", "command 2 to 3", "after command 3", "(extra)"];
++    for (i, s) in stretches.iter().enumerate().take(cur + 1) {
++        info!(
++            "{}: start {} us, length {} us | transactions {} busy {} us | interrupt raised {} us in {} rises, longest {} us | answered {} times: mean {} us, min {} us, max {} us | first chip-select at +{} us, first rise after it at +{} us",
++            names[i],
++            s.start * US,
++            s.samples * US,
++            s.transactions,
++            s.busy * US,
++            s.raised * US,
++            s.rises,
++            s.longest_raised * US,
++            s.answered,
++            if s.answered > 0 { s.answer_total * US / s.answered } else { 0 },
++            if s.answered > 0 { s.answer_min * US } else { 0 },
++            s.answer_max * US,
++            if s.first_cs == u32::MAX { 0 } else { s.first_cs * US },
++            if s.first_rise_after == u32::MAX { 0 } else { s.first_rise_after * US }
++        );
++    }
++    for chunk in 0..3 {
++        info!("transactions per 10 ms, from {} ms: {}", chunk * 500, bin_tx[chunk * 50..chunk * 50 + 50]);
++    }
++    for chunk in 0..3 {
++        info!(
++            "samples (4 us each) with the interrupt raised per 10 ms, from {} ms: {}",
++            chunk * 500,
++            bin_raised[chunk * 50..chunk * 50 + 50]
++        );
++    }
++    info!("done");
++    loop {
++        Timer::after_secs(60).await;
++    }
++}
+-- 
+2.43.0
+

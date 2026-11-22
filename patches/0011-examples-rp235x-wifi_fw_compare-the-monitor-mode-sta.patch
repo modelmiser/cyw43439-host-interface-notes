@@ -1,0 +1,159 @@
+From b9d9cd28bc4aad3f4b590690b03e967a291f665d Mon Sep 17 00:00:00 2001
+From: Chad Aldreda <ca@modelmiser.com>
+Date: Sun, 22 Nov 2026 02:08:13 -0800
+Subject: [PATCH] =?UTF-8?q?examples/rp235x:=20wifi=5Ffw=5Fcompare=20?=
+ =?UTF-8?q?=E2=80=94=20the=20monitor-mode=20stall=20on=20another=20release?=
+ =?UTF-8?q?d=20firmware=20build?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ examples/rp235x/src/bin/wifi_fw_compare.rs | 134 +++++++++++++++++++++
+ 1 file changed, 134 insertions(+)
+ create mode 100644 examples/rp235x/src/bin/wifi_fw_compare.rs
+
+diff --git a/examples/rp235x/src/bin/wifi_fw_compare.rs b/examples/rp235x/src/bin/wifi_fw_compare.rs
+new file mode 100644
+index 000000000..cb266c75f
+--- /dev/null
++++ b/examples/rp235x/src/bin/wifi_fw_compare.rs
+@@ -0,0 +1,134 @@
++//! Does another released firmware build show the same monitor-mode stall? No Wi-Fi Direct state,
++//! no Bluetooth. The image and its regulatory table are read from `cyw43-firmware/alt/fw.bin` and
++//! `cyw43-firmware/alt/clm.bin` (not in the repository: copy the build under test there). Prints
++//! the firmware's own version text, then its "memuse" line before monitor mode and after each of
++//! two 15 s windows with no commands, and the frames delivered in each.
++
++#![no_std]
++#![no_main]
++
++use cyw43::aligned_bytes;
++use cyw43_pio::{PioSpi, RM2_CLOCK_DIVIDER};
++use defmt::*;
++use defmt_rtt as _;
++use embassy_executor::Spawner;
++use embassy_rp::gpio::{Level, Output};
++use embassy_rp::peripherals::{DMA_CH0, DMA_CH1, PIO0};
++use embassy_rp::pio::{InterruptHandler, Pio};
++use embassy_rp::{bind_interrupts, dma};
++use embassy_time::Timer;
++use panic_probe as _;
++use static_cell::StaticCell;
++
++bind_interrupts!(struct Irqs {
++    PIO0_IRQ_0 => InterruptHandler<PIO0>;
++    DMA_IRQ_0 => dma::InterruptHandler<DMA_CH0>, dma::InterruptHandler<DMA_CH1>;
++});
++
++#[embassy_executor::task]
++async fn cyw43_task(
++    runner: cyw43::Runner<'static, cyw43::SpiBus<Output<'static>, PioSpi<'static, PIO0, 0>>, cyw43::Cyw43439>,
++) -> ! {
++    runner.run().await
++}
++
++async fn gauge(control: &mut cyw43::Control<'static>, name: &str) {
++    static mut BUF: [u8; 512] = [0; 512];
++    // SAFETY: single task, used sequentially.
++    #[allow(static_mut_refs)]
++    let buf = unsafe { &mut BUF };
++    let (status, len) = control.diag_get_iovar_buf("memuse", &mut buf[..]).await;
++    let end = len.min(512);
++    let n = buf[..end].iter().position(|c| *c == 0 || *c == b'\n').unwrap_or(end);
++    let b = cyw43::diag_bus_take();
++    info!(
++        "{}: memuse status {} [{=[u8]:a}] | seq {} max {} credit last {}",
++        name,
++        status,
++        buf[..n],
++        b.seq,
++        b.seq_max,
++        b.credit_last
++    );
++}
++
++#[embassy_executor::main(executor = "embassy_rp::executor::Executor", entry = "cortex_m_rt::entry")]
++async fn main(spawner: Spawner) {
++    let p = embassy_rp::init(Default::default());
++    let fw = aligned_bytes!("../../../../cyw43-firmware/alt/fw.bin");
++    let clm = aligned_bytes!("../../../../cyw43-firmware/alt/clm.bin");
++    let nvram = aligned_bytes!("../../../../cyw43-firmware/nvram_rp2040.bin");
++
++    let pwr = Output::new(p.PIN_23, Level::Low);
++    let cs = Output::new(p.PIN_25, Level::High);
++    let mut pio = Pio::new(p.PIO0, Irqs);
++    let spi = PioSpi::new(
++        &mut pio.common,
++        pio.sm0,
++        RM2_CLOCK_DIVIDER,
++        pio.irq0,
++        cs,
++        p.PIN_24,
++        p.PIN_29,
++        dma::Channel::new(p.DMA_CH0, Irqs),
++        dma::Channel::new(p.DMA_CH1, Irqs),
++    );
++
++    static STATE: StaticCell<cyw43::State> = StaticCell::new();
++    let state = STATE.init(cyw43::State::new());
++    let (_net_device, mut control, runner) = cyw43::new(state, pwr, spi, fw, nvram).await;
++    spawner.spawn(unwrap!(cyw43_task(runner)));
++    control.init(clm, cyw43::Config::default()).await;
++
++    cyw43::diag_bus_config(100, false);
++    let _ = cyw43::diag_bus_take();
++    Timer::after_secs(2).await;
++    {
++        static mut VER: [u8; 256] = [0; 256];
++        // SAFETY: single task, used once.
++        #[allow(static_mut_refs)]
++        let buf = unsafe { &mut VER };
++        let (status, len) = control.diag_get_iovar_buf("ver", &mut buf[..]).await;
++        let end = len.min(256);
++        let n = buf[..end].iter().position(|c| *c == 0).unwrap_or(end);
++        info!("ver status {} [{=[u8]:a}]", status, buf[..n]);
++    }
++    let mut res = [0u8; 4];
++    let (s, _) = control.diag_get_iovar("mpc", &mut res).await;
++    info!("mpc status {} value {}", s, u32::from_le_bytes(res));
++    gauge(&mut control, "start").await;
++    let am = control.diag_set_allmulti(true).await;
++    gauge(&mut control, "allmulti on").await;
++    let (ms, _) = control.diag_monitor(Some(1)).await;
++    let _ = cyw43::diag_rx_take();
++    Timer::after_secs(15).await;
++    let rx = cyw43::diag_rx_take();
++    info!(
++        "monitor on (allmulti {} set {}), window A, no commands for 15 s -> frames: {} bytes: {}",
++        am, ms, rx.frames, rx.bytes
++    );
++    gauge(&mut control, "after window A").await;
++    Timer::after_secs(15).await;
++    let rx = cyw43::diag_rx_take();
++    info!("window B, 15 s -> frames: {} bytes: {}", rx.frames, rx.bytes);
++    gauge(&mut control, "after window B").await;
++    let (rs, value) = control.diag_monitor(None).await;
++    info!("monitor readback status {} value {}", rs, value);
++    let (m0, _) = control.diag_monitor(Some(0)).await;
++    let _ = control.diag_set_allmulti(false).await;
++    Timer::after_millis(500).await;
++    info!("monitor off {}", m0);
++    let mut n = 0u32;
++    {
++        let mut scanner = control.scan(Default::default()).await;
++        while scanner.next().await.is_some() {
++            n += 1;
++        }
++    }
++    info!("scan results: {}", n);
++    gauge(&mut control, "end").await;
++    info!("done");
++    loop {
++        Timer::after_secs(60).await;
++    }
++}
+-- 
+2.43.0
+

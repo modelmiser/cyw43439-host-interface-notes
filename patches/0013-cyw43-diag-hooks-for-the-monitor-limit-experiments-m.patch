@@ -1,0 +1,395 @@
+From 1dda2292da114bfaea5415715d6fce589d0b9b8e Mon Sep 17 00:00:00 2001
+From: Chad Aldreda <ca@modelmiser.com>
+Date: Sun, 22 Nov 2026 05:25:46 -0800
+Subject: [PATCH] =?UTF-8?q?cyw43=20diag:=20hooks=20for=20the=20monitor-lim?=
+ =?UTF-8?q?it=20experiments=20=E2=80=94=20marker=20count=20and=20per-frame?=
+ =?UTF-8?q?=20sizes,=20data-packet=20send,=20ignore-limit=20switch,=20cons?=
+ =?UTF-8?q?ole=20text,=20in-place=20restart?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ cyw43/src/diag.rs   | 172 +++++++++++++++++++++++++++++++++++++++++++-
+ cyw43/src/ioctl.rs  |   7 ++
+ cyw43/src/lib.rs    |   4 ++
+ cyw43/src/runner.rs |  84 +++++++++++++++++++++-
+ 4 files changed, 265 insertions(+), 2 deletions(-)
+
+diff --git a/cyw43/src/diag.rs b/cyw43/src/diag.rs
+index 8e46e38a3..978ddb546 100644
+--- a/cyw43/src/diag.rs
++++ b/cyw43/src/diag.rs
+@@ -41,8 +41,27 @@ pub struct DiagRx {
+     pub lens: [u16; DIAG_SAMPLES],
+     /// The first `DIAG_HEAD` bytes of each sampled frame.
+     pub heads: [[u8; DIAG_HEAD]; DIAG_SAMPLES],
++    /// Arrival time of each of the first `DIAG_TIMES` frames, in ms since the previous take.
++    pub times: [u16; DIAG_TIMES],
++    /// First byte of each of those frames (the 802.11 frame-control low byte).
++    pub firsts: [u8; DIAG_TIMES],
++    /// Length of each of those frames.
++    pub sizes: [u16; DIAG_TIMES],
++    /// Bit `i` set: frame `i` of those carried the marker address (see `DIAG_MARK`).
++    pub marked: u64,
++    /// Frames, of all received, that carried the marker address.
++    pub marks: u32,
++    /// When the previous take happened, in ms since boot.
++    pub base_ms: u64,
+ }
+ 
++/// Frames whose arrival time, first byte and length are kept per interval.
++pub const DIAG_TIMES: usize = 40;
++
++/// Marker: a frame whose transmitter address (bytes 10..16) equals this was sent by the test
++/// transmitter (`tools/inject_test.py` in the notes repository).
++pub const DIAG_MARK: [u8; 6] = [0x02, 0xc0, 0xff, 0xee, 0x00, 0x01];
++
+ impl DiagRx {
+     const fn new() -> Self {
+         Self {
+@@ -52,6 +71,12 @@ impl DiagRx {
+             samples: 0,
+             lens: [0; DIAG_SAMPLES],
+             heads: [[0; DIAG_HEAD]; DIAG_SAMPLES],
++            times: [0; DIAG_TIMES],
++            firsts: [0; DIAG_TIMES],
++            sizes: [0; DIAG_TIMES],
++            marked: 0,
++            marks: 0,
++            base_ms: 0,
+         }
+     }
+ }
+@@ -59,8 +84,22 @@ impl DiagRx {
+ static RX: Mutex<CriticalSectionRawMutex, RefCell<DiagRx>> = Mutex::new(RefCell::new(DiagRx::new()));
+ 
+ pub(crate) fn rx_frame(packet: &[u8]) {
++    let now = embassy_time::Instant::now().as_millis();
+     RX.lock(|rx| {
+         let mut rx = rx.borrow_mut();
++        let n = rx.frames as usize;
++        let mark = packet.len() >= 16 && packet[10..16] == DIAG_MARK;
++        if mark {
++            rx.marks = rx.marks.wrapping_add(1);
++        }
++        if n < DIAG_TIMES {
++            rx.times[n] = now.saturating_sub(rx.base_ms).min(u16::MAX as u64) as u16;
++            rx.firsts[n] = packet.first().copied().unwrap_or(0);
++            rx.sizes[n] = packet.len().min(u16::MAX as usize) as u16;
++            if mark {
++                rx.marked |= 1 << n;
++            }
++        }
+         rx.frames = rx.frames.wrapping_add(1);
+         rx.bytes = rx.bytes.wrapping_add(packet.len() as u32);
+         if let Some(&b) = packet.first() {
+@@ -82,7 +121,9 @@ pub(crate) fn rx_frame(packet: &[u8]) {
+ 
+ /// Take and reset the data-channel counters and samples.
+ pub fn diag_rx_take() -> DiagRx {
+-    RX.lock(|rx| rx.replace(DiagRx::new()))
++    let mut fresh = DiagRx::new();
++    fresh.base_ms = embassy_time::Instant::now().as_millis();
++    RX.lock(|rx| rx.replace(fresh))
+ }
+ 
+ /// Event samples kept per `diag_events_take` interval.
+@@ -363,3 +404,132 @@ pub(crate) fn bus_core(vals: [u32; 16]) {
+ pub fn diag_keyhole(on: bool) {
+     X_CORE.store(on, core::sync::atomic::Ordering::Relaxed);
+ }
++
++// ---- Hooks for the monitor-limit experiments ----
++
++use core::cell::Cell;
++use core::sync::atomic::Ordering::Relaxed;
++use core::sync::atomic::AtomicBool;
++
++use aligned::{A4, Aligned};
++
++/// Data packets queued and sent. (A mutex, not atomic arithmetic: thumbv6m has no atomic add.)
++static DATA_TX: Mutex<CriticalSectionRawMutex, Cell<(u32, u32)>> = Mutex::new(Cell::new((0, 0)));
++
++/// Ask the runner to send `n` small broadcast data packets, one per pass of its loop, while it
++/// has send credit. There is no waker: the runner picks the request up when it next wakes, so keep
++/// the bus probe's timer on (`diag_bus_config` with a few ms) while using this.
++pub fn diag_send_data(n: u32) {
++    DATA_TX.lock(|c| {
++        let (queued, sent) = c.get();
++        c.set((queued.saturating_add(n), sent));
++    })
++}
++
++/// Data packets sent for `diag_send_data` since the previous call, and how many were still queued
++/// (the queue is cleared).
++pub fn diag_data_sent() -> (u32, u32) {
++    DATA_TX.lock(|c| {
++        let (queued, sent) = c.replace((0, 0));
++        (sent, queued)
++    })
++}
++
++pub(crate) fn take_data_tx() -> bool {
++    DATA_TX.lock(|c| {
++        let (queued, sent) = c.get();
++        if queued == 0 {
++            return false;
++        }
++        c.set((queued - 1, sent));
++        true
++    })
++}
++
++pub(crate) fn data_tx_sent() {
++    DATA_TX.lock(|c| {
++        let (queued, sent) = c.get();
++        c.set((queued, sent.wrapping_add(1)));
++    })
++}
++
++pub(crate) static IGNORE_CREDIT: AtomicBool = AtomicBool::new(false);
++
++/// With `on`, the runner sends even when the firmware's send limit says it may not.
++pub fn diag_ignore_credit(on: bool) {
++    IGNORE_CREDIT.store(on, Relaxed);
++}
++
++type Images = (&'static Aligned<A4, [u8]>, &'static Aligned<A4, [u8]>);
++static RESTART: Mutex<CriticalSectionRawMutex, Cell<Option<Images>>> = Mutex::new(Cell::new(None));
++/// Restarts completed, restarts failed, duration of the last in ms.
++static RESTARTS: Mutex<CriticalSectionRawMutex, Cell<(u32, u32, u32)>> = Mutex::new(Cell::new((0, 0, 0)));
++
++/// Ask the runner to power-cycle the radio and load the firmware again, in place (no Bluetooth).
++/// Any command in flight is abandoned. Afterwards the application must call `Control::init`
++/// again. Like `diag_send_data`, this is picked up when the runner next wakes.
++pub fn diag_request_restart(wifi_fw: &'static Aligned<A4, [u8]>, nvram: &'static Aligned<A4, [u8]>) {
++    RESTART.lock(|r| r.set(Some((wifi_fw, nvram))));
++}
++
++/// Restarts completed, restarts that failed, and how long the last one took in ms.
++pub fn diag_restart_result() -> (u32, u32, u32) {
++    RESTARTS.lock(|r| r.get())
++}
++
++pub(crate) fn take_restart() -> Option<Images> {
++    RESTART.lock(|r| r.take())
++}
++
++pub(crate) fn restart_done(ok: bool, millis: u32) {
++    RESTARTS.lock(|r| {
++        let (done, failed, _) = r.get();
++        r.set(if ok { (done + 1, failed, millis) } else { (done, failed + 1, millis) });
++    })
++}
++
++/// Bytes of firmware console text kept between `diag_console_take` calls.
++pub const DIAG_CONSOLE: usize = 4096;
++
++struct Console {
++    buf: [u8; DIAG_CONSOLE],
++    len: usize,
++    lost: u32,
++}
++
++static CONSOLE: Mutex<CriticalSectionRawMutex, RefCell<Console>> = Mutex::new(RefCell::new(Console {
++    buf: [0; DIAG_CONSOLE],
++    len: 0,
++    lost: 0,
++}));
++
++/// A line of the firmware's own console log, as the `firmware-logs` reader found it.
++#[allow(dead_code)]
++pub(crate) fn console_line(line: &[u8]) {
++    CONSOLE.lock(|c| {
++        let mut c = c.borrow_mut();
++        let at = c.len;
++        if at + line.len() + 1 > DIAG_CONSOLE {
++            c.lost += 1;
++            return;
++        }
++        c.buf[at..at + line.len()].copy_from_slice(line);
++        c.buf[at + line.len()] = b'\n';
++        c.len = at + line.len() + 1;
++    })
++}
++
++/// Take the firmware console text gathered since the previous call (lines separated by `\n`) into
++/// `out`; returns the bytes copied and how many lines were dropped for lack of room. Empty unless
++/// the `firmware-logs` feature is on.
++pub fn diag_console_take(out: &mut [u8]) -> (usize, u32) {
++    CONSOLE.lock(|c| {
++        let mut c = c.borrow_mut();
++        let n = c.len.min(out.len());
++        out[..n].copy_from_slice(&c.buf[..n]);
++        let lost = c.lost;
++        c.len = 0;
++        c.lost = 0;
++        (n, lost)
++    })
++}
+diff --git a/cyw43/src/ioctl.rs b/cyw43/src/ioctl.rs
+index 99fa797ed..941e78ade 100644
+--- a/cyw43/src/ioctl.rs
++++ b/cyw43/src/ioctl.rs
+@@ -105,6 +105,13 @@ impl IoctlState {
+         self.state.set(IoctlStateInner::Done { resp_len: 0 });
+     }
+ 
++    /// Diagnostic: give up whatever command is in flight and wake its caller, which then sees an
++    /// empty reply. Used by the in-place restart.
++    pub fn abandon_ioctl(&self) {
++        self.state.set(IoctlStateInner::Done { resp_len: 0 });
++        self.wake_control();
++    }
++
+     /// Whether no ioctl is submitted or in flight right now.
+     pub fn is_idle(&self) -> bool {
+         matches!(self.state.get(), IoctlStateInner::Done { .. })
+diff --git a/cyw43/src/lib.rs b/cyw43/src/lib.rs
+index 6db223f55..691cb38e9 100644
+--- a/cyw43/src/lib.rs
++++ b/cyw43/src/lib.rs
+@@ -39,6 +39,10 @@ pub use crate::diag::{
+     DIAG_BAD_REQUEST, DIAG_EV_SAMPLED, DIAG_EV_SAMPLES, DIAG_HEAD, DIAG_NO_REPLY, DIAG_SAMPLES, DiagBus, DiagEvents,
+     DiagRx, diag_bus_config, diag_bus_take, diag_events_take, diag_experiment, diag_keyhole, diag_rx_take,
+ };
++pub use crate::diag::{
++    DIAG_CONSOLE, DIAG_MARK, DIAG_TIMES, diag_console_take, diag_data_sent, diag_ignore_credit, diag_request_restart,
++    diag_restart_result, diag_send_data,
++};
+ pub use crate::runner::Runner;
+ pub use crate::sdio::SdioBus;
+ pub use crate::spi::{SpiBus, SpiBusCyw43};
+diff --git a/cyw43/src/runner.rs b/cyw43/src/runner.rs
+index c0bcc1669..ec703b37f 100644
+--- a/cyw43/src/runner.rs
++++ b/cyw43/src/runner.rs
+@@ -734,6 +734,9 @@ impl<'a, BUS: Bus, CHIP: Chip> Runner<'a, BUS, CHIP> {
+         let shared = SharedMemData::from_bytes(&shared);
+ 
+         self.log.addr = shared.console_addr + 8;
++        // A reloaded firmware starts its log again.
++        self.log.last_idx = 0;
++        self.log.buf_count = 0;
+     }
+ 
+     #[cfg(feature = "firmware-logs")]
+@@ -761,6 +764,7 @@ impl<'a, BUS: Bus, CHIP: Chip> Runner<'a, BUS, CHIP> {
+                 if self.log.buf_count != 0 {
+                     let s = unsafe { core::str::from_utf8_unchecked(&self.log.buf[..self.log.buf_count]) };
+                     debug!("LOGS: {}", s);
++                    crate::diag::console_line(s.as_bytes());
+                     self.log.buf_count = 0;
+                 }
+             } else if self.log.buf_count < self.log.buf.len() {
+@@ -834,6 +838,15 @@ impl<'a, BUS: Bus, CHIP: Chip> Runner<'a, BUS, CHIP> {
+                 continue;
+             }
+ 
++            if let Some((wifi_fw, nvram)) = crate::diag::take_restart() {
++                self.diag_restart(wifi_fw, nvram).await;
++                continue;
++            }
++            if self.has_credit() && crate::diag::take_data_tx() {
++                self.diag_send_data(&mut buf).await;
++                continue;
++            }
++
+             if self.has_credit() {
+                 let ioctl = self.ioctl_state.wait_pending();
+                 // The multicast filter list the stack wants, when it changes. Applying
+@@ -974,12 +987,78 @@ impl<'a, BUS: Bus, CHIP: Chip> Runner<'a, BUS, CHIP> {
+                     let _ = select(bt_rx, self.bus.wait_for_event()).await;
+                 }
+                 #[cfg(not(feature = "bluetooth"))]
+-                self.bus.wait_for_event().await;
++                {
++                    // Diagnostic: with the bus probe's timer on, wake without an interrupt too, so
++                    // that a restart request is seen while the send credit is used up.
++                    let diag_ms = crate::diag::SAMPLE_MS.load(Relaxed);
++                    if diag_ms == 0 {
++                        self.bus.wait_for_event().await;
++                    } else if let Either::Second(()) =
++                        select(self.bus.wait_for_event(), Timer::after_millis(diag_ms as u64)).await
++                    {
++                        continue;
++                    }
++                }
+                 self.handle_irq(&mut buf).await;
+             }
+         }
+     }
+ 
++    /// Diagnostic: power-cycle the radio and load the firmware again, in place.
++    async fn diag_restart(&mut self, wifi_fw: &Aligned<A4, [u8]>, nvram: &Aligned<A4, [u8]>) {
++        let started = Instant::now();
++        self.ioctl_state.abandon_ioctl();
++        self.ioctl_id = 0;
++        self.sdpcm_seq = 0;
++        self.sdpcm_seq_max = 1;
++        self.inline_ioctl_pending = false;
++        self.allmulti = false;
++        let ok = self.init(wifi_fw, nvram, None).await.is_ok();
++        crate::diag::restart_done(ok, started.elapsed().as_millis() as u32);
++    }
++
++    /// Diagnostic: send one 60-byte broadcast Ethernet frame (experimental ethertype 0x88b5) on
++    /// the data channel, the way a network packet is sent.
++    async fn diag_send_data(&mut self, buf: &mut Aligned<A4, [u8]>) {
++        const PADDING_SIZE: usize = 2;
++        const PACKET: usize = 60;
++        let write_buffer = WriteBuffer::new(buf);
++        let buf8 = write_buffer.buf();
++        let total_len = SdpcmHeader::SIZE + PADDING_SIZE + BdcHeader::SIZE + PACKET;
++        let seq = self.sdpcm_seq;
++        self.sdpcm_seq = self.sdpcm_seq.wrapping_add(1);
++        let sdpcm_header = SdpcmHeader {
++            len: total_len as u16,
++            len_inv: !total_len as u16,
++            sequence: seq,
++            channel_and_flags: CHANNEL_TYPE_DATA,
++            next_length: 0,
++            header_length: (SdpcmHeader::SIZE + PADDING_SIZE) as _,
++            wireless_flow_control: 0,
++            bus_data_credit: 0,
++            reserved: [0, 0],
++        };
++        let bdc_header = BdcHeader {
++            flags: BDC_VERSION << BDC_VERSION_SHIFT,
++            priority: 0,
++            flags2: 0,
++            data_offset: 0,
++        };
++        buf8[..total_len + 4].fill(0);
++        buf8[0..SdpcmHeader::SIZE].copy_from_slice(sdpcm_header.to_bytes());
++        buf8[SdpcmHeader::SIZE + PADDING_SIZE..][..BdcHeader::SIZE].copy_from_slice(bdc_header.to_bytes());
++        let packet = &mut buf8[SdpcmHeader::SIZE + PADDING_SIZE + BdcHeader::SIZE..][..PACKET];
++        packet[..6].fill(0xff);
++        packet[6..12].copy_from_slice(&crate::diag::DIAG_MARK);
++        packet[12] = 0x88;
++        packet[13] = 0xb5;
++        let total_len = (total_len + 3) & !3;
++        if self.wlan_write(&mut write_buffer[..total_len]).await.is_ok() {
++            crate::diag::data_tx_sent();
++        }
++        self.check_status(buf).await;
++    }
++
+     /// Wait for IRQ on F2 packet available
+     /// Diagnostic: sample the bus status and interrupt registers without being asked to by an
+     /// interrupt or a command; optionally read a waiting packet. SPI only.
+@@ -1445,6 +1524,9 @@ impl<'a, BUS: Bus, CHIP: Chip> Runner<'a, BUS, CHIP> {
+     }
+ 
+     fn has_credit(&self) -> bool {
++        if crate::diag::IGNORE_CREDIT.load(Relaxed) {
++            return true;
++        }
+         self.sdpcm_seq != self.sdpcm_seq_max && self.sdpcm_seq_max.wrapping_sub(self.sdpcm_seq) & 0x80 == 0
+     }
+ 
+-- 
+2.43.0
+

@@ -41,7 +41,7 @@ treat every `[board]` result as "this happened here", not "this is how the chip 
 
 Upstream `cyw43` has no public call for arbitrary commands, raw events or raw data-channel frames.
 The trials used a small diagnostics patch to the driver, included here with an example program
-(the ten files in `patches/`, exported with `git format-patch` against embassy main `bb6ce6898`; apply
+(the fourteen files in `patches/`, exported with `git format-patch` against embassy main `bb6ce6898`; apply
 them in order with `git am`); it is not upstream and not proposed for upstream. Every event count in these
 notes was taken by that patch after the driver's packet-validity checks and before its own event mask
 and two-entry event queue.
@@ -55,7 +55,9 @@ sequence with it, without Bluetooth, and produced the credit figures quoted in �
 `wifi_downup`, does the same with no Wi-Fi Direct state and across an interface down and up. The probe
 consumes the driver's cached status word, so it adds bus traffic of its own, and it was running in
 every monitor-mode run reported here except those added on 2026-11-22 (the last subsection of §7),
-which used hooks that are not among the patches and say for themselves where the probe ran. The first
+which say for themselves where the probe ran. Four further patches carry the hooks and examples for
+that subsection (`wifi_fw_compare`, `wifi_bus_watch`, `wifi_monitor_limit`, `wifi_keyhole_sweep`), and
+`tools/inject_test.py` is the script for its test transmitter. The first
 example (`wifi_interface_probe`), built against upstream embassy with only the patch and without
 Bluetooth, was run once; for the seven variables it reads, the listen-state sequence and a single
 monitor window it gave the same results as the test firmware (it runs no scans). Every run, test
@@ -367,8 +369,8 @@ watch is another, one boot. Channel and
 listen state are given per bullet. The driver in these boots reads the bus when the radio raises its
 interrupt line and after each packet it sends; the status-sampling probe of the patches ran in
 the host-action rounds, the limit boot and the three build-comparison boots, and did not read packets;
-it was off in the bus watch. **None of this can be reproduced from the repository as it stands** (see "Code" at the
-end of the list).
+it was off in the bus watch. The patches carry no-Bluetooth versions of the test-firmware experiments, each run on this board
+(see "Rerun from the patches" at the end of the list).
 
 - **No setting tried, once each, changed the outcome** `[board ×1, seven rounds]`. Without the listen
   state: `mpc` (reads 1; set to 0 and read back as 0), SetMonitor values 2 and 3 (each accepted and
@@ -478,15 +480,50 @@ end of the list).
   packets brought 12 frames; not looked into. Restart and `memuse` were as before (about 1.6 s with
   the Wi-Fi setup; 17 → 4 → 17). The pump uses up the send credit, which is the state in which
   commands hang (above), so it is only of use immediately before a restart.
+- **The firmware reports nothing at the stall beyond its counters and the buffer figure**
+  `[board ×2: the test firmware with Bluetooth, and the wifi_keyhole_sweep example without; eight
+  monitor sessions and one control session each, listen state on channel 11]`. Its console log (the
+  text the firmware prints for itself, which embassy's `firmware-logs` feature reads) showed the
+  start-up lines after each restart and a line or two for each rejected variable name, and nothing
+  at monitor-on, during the burst or after it. (In the test-firmware run the 4,096-byte capture
+  dropped 43 of the lines printed while names were being rejected; none were dropped in any session,
+  nor in the example run, which empties the capture more often.) Of 137 variable names from whd's header (those that
+  look like actions, clears or keys left out; reads only), 74 answered, 58 were unsupported and 5
+  returned other errors, the same in both runs. Read before monitor and again 1 s after it, ten
+  names per session, only three changed, in either run: `counters`, `memuse` (17 → 4) and `vndr_ie`
+  (its reply held different leftover bytes; unchanged in the control). In `counters` over that
+  second, monitor against the control session without it, the two runs in turn: frames taken in
+  (`unchained`) +31 and +31 against +67 and +87; `rxnobuf` +19 and +19 against 0 and 0; `rxf0ovfl`
+  +35 and +98 against 0 and 0. So without monitor the firmware took in 67 and 87 frames in that
+  second and counted no shortage; with monitor it took in about 30 and then counted out-of-buffer
+  and overflow errors. One control session per run.
 - **What these runs do not show:** why the free-buffer figure does not recover; why 30; anything
   on a second board; the per-packet rule or the limit on the other two builds. The test
   transmitter's frames were identified by their transmitter address in the frames the board
   delivered; the transmitting interface did not report its own transmissions.
-- **Code.** These runs used a local test firmware, a script for the second radio, and driver hooks
-  that are not among the ten patches: a count of frames carrying a marker address, a request to
-  send small data packets, a switch to ignore the send limit, and the restart-with-pump loop. The
-  build comparison used a variant of the `wifi_downup` example that reads its image from another
-  file, and the bus watch is a further example program. Until those are published, this subsection is a report, not something a reader can rerun.
+- **Rerun from the patches** `[board ×1 per example, no Bluetooth]`. The last four patches carry the
+  hooks (a count of frames with a marker address and per-frame sizes, a request to send small data
+  packets, a switch to ignore the send limit, the firmware's console text, an in-place radio
+  restart) and four examples: `wifi_monitor_limit` (settings, burst, pool readings, host actions,
+  packets past the limit, the pump), `wifi_keyhole_sweep`, `wifi_fw_compare` (which reads its image
+  from `cyw43-firmware/alt/`, not in the repository) and `wifi_bus_watch`. `tools/inject_test.py`
+  is the second radio's script; it needs a monitor interface and root, and it loads the channel
+  (see its header). The last two examples are
+  the programs behind the build comparison and the bus watch above. The first two are ports of
+  the test-firmware experiments, which ran with Bluetooth; one run of each without it gave:
+  settings, six rounds: 30 frames then 1, and 17 → 4, in each. Burst, ten rounds: 30 frames within
+  171 to 405 ms and a 31st with the command at 4 s, in each (the test transmitter was not running;
+  frames of 14 to 344 bytes). Pool readings, nine rounds: 14 with 3 frames delivered, 4 with 13 or
+  more. Host actions, twelve rounds: 0, 5, 5, 5, 5 and 10 as in the table, twice over. Packets past
+  the limit, four rounds: 16 frames each and the following command unanswered; the control round
+  answered. The pump, four rounds: 46 frames each (15 packets sent, 1 held back); the restart took
+  0.52 s, about 1.35 s with the Wi-Fi setup. The sweep's figures are in the bullet above. In these
+  examples the bus probe's timer runs at 20 ms, because it is what wakes the driver to pick up the
+  requests. These figures are from the code as published; an earlier run, before three small fixes to
+  the hooks, gave the same counts. No command in the examples has a timeout apart from one in the
+  limit part, so if the firmware stops answering they wait. With the listen dwell already running
+  and no Bluetooth, the figure read 17 before monitor in these runs; why the earlier
+  no-Bluetooth read gave 33 is not established (it was made before a dwell was started).
 
 ### Example: Wi-Fi Aware publish frames
 
@@ -583,5 +620,5 @@ the first bytes of received frames in memory for printing; none of that output i
 
 ## Licence
 
-The text is under the MIT licence (`LICENSE`). The files in `patches/` are changes to embassy and are
+The text and the script in `tools/` are under the MIT licence (`LICENSE`). The files in `patches/` are changes to embassy and are
 offered under embassy's own licences (MIT or Apache-2.0).
