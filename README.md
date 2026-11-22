@@ -358,14 +358,16 @@ and commands then time out. That issue predates the firmware image used here.
 
 ### What the limit is, and what moves it (added 2026-11-22)
 
-Eight further boots on the same board. Five ran a test firmware with Bluetooth running, one boot per
+Nine further boots on the same board. Five ran a test firmware with Bluetooth running, one boot per
 bullet marked `[board ×1, … rounds]` below (settings; the 40-round burst run; host actions and the pool
 readings, one boot; packets past the limit; the pump); in those the radio was restarted in place after
 every round, so each round ("round" = one monitor session) starts from freshly loaded firmware. The
-build comparison is a separate example program without Bluetooth, one boot per image. Channel and
+build comparison is a separate example program without Bluetooth, one boot per image, and the bus
+watch is another, one boot. Channel and
 listen state are given per bullet. The driver in these boots reads the bus when the radio raises its
 interrupt line and after each packet it sends; the status-sampling probe of the patches ran in
-the host-action rounds, the limit boot and the three build-comparison boots, and did not read packets. **None of this can be reproduced from the repository as it stands** (see "Code" at the
+the host-action rounds, the limit boot and the three build-comparison boots, and did not read packets;
+it was off in the bus watch. **None of this can be reproduced from the repository as it stands** (see "Code" at the
 end of the list).
 
 - **No setting tried, once each, changed the outcome** `[board ×1, seven rounds]`. Without the listen
@@ -453,6 +455,21 @@ end of the list).
   whether those buffers are the delivered frames' own is not shown. This was measured from that
   start only (from 33, without Bluetooth, the figure had fallen by 29 over
   a window of 32 frames, above). With a start of 17 the 30-frame limit is not the figure reaching 4.
+- **On the wire, the stall is the radio not raising its interrupt**
+  `[board ×1, one session, no Bluetooth, listen state on channel 11]`. A spare PIO block sampled the
+  data line (which the radio raises as its interrupt while chip-select is idle) and chip-select
+  every 4 µs for 1.5 s across one session, reading the pins only: monitor on at 100 ms, then one
+  4-byte read command at 900, 1,100 and 1,300 ms. 30 frames arrived, then 1 with each command. All
+  of the burst's bus activity fell between about 100 and 220 ms, in three clumps: 121 transactions,
+  the monitor-on command's included; in 54 of the idle gaps between them the line was high, 1.1 ms
+  in total, and each time it stayed high until the driver's next transaction, 8 to 48 µs later.
+  From then until the first command, about 680 ms, no sample showed the line high and there was no
+  transaction. Each command brought 8 transactions, its own included, within 10 ms, the line high
+  in 3 gaps, the first about 110 µs after the command's own transaction began; then nothing until
+  the next command. One run. A pulse shorter than the sample spacing would be missed by the
+  sampler, though one the driver caught would have shown as a transaction. This agrees, at the
+  pins, with "Nothing was left waiting on the bus" (above): during the stall the radio did not
+  signal the host.
 - **The restart workaround, with a pump** `[board ×1, four rounds, listen state on channel 6]`.
   Before each restart the driver sent up to 16 of the 60-byte data packets, keeping to the send
   limit: 13 to 15 were sent and the rest were held back by the limit (the same commands preceded the
@@ -469,7 +486,7 @@ end of the list).
   that are not among the ten patches: a count of frames carrying a marker address, a request to
   send small data packets, a switch to ignore the send limit, and the restart-with-pump loop. The
   build comparison used a variant of the `wifi_downup` example that reads its image from another
-  file. Until those are published, this subsection is a report, not something a reader can rerun.
+  file, and the bus watch is a further example program. Until those are published, this subsection is a report, not something a reader can rerun.
 
 ### Example: Wi-Fi Aware publish frames
 
