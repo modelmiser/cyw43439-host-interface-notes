@@ -36,7 +36,7 @@ board results; its own README covers its conventions and the licences of its sou
 **The hardware.** One Pico 2 W, SPI bus, the Wi-Fi firmware build embassy ships: `7.95.61 (abcd531 CY)`
 as its start-up log reports (`RTE (SDIO-CDC) 7.95.61 (abcd531 CY) on BCM43439 r5`). The c-driver file
 this build comes from is named `wb43439A0_7_95_49_00_combined.h`; the name and the tag differ. One board and
-one firmware build:
+one firmware build (two other builds were run once each for the monitor burst and pool figures only, §7):
 treat every `[board]` result as "this happened here", not "this is how the chip behaves".
 
 Upstream `cyw43` has no public call for arbitrary commands, raw events or raw data-channel frames.
@@ -54,7 +54,8 @@ sequence with it, without Bluetooth, and produced the credit figures quoted in �
 `wifi_teardown`, reads that line after each step of undoing monitor mode. A sixth,
 `wifi_downup`, does the same with no Wi-Fi Direct state and across an interface down and up. The probe
 consumes the driver's cached status word, so it adds bus traffic of its own, and it was running in
-every monitor-mode run reported here. The first
+every monitor-mode run reported here except those added on 2026-11-22 (the last subsection of §7),
+which used hooks that are not among the patches and say for themselves where the probe ran. The first
 example (`wifi_interface_probe`), built against upstream embassy with only the patch and without
 Bluetooth, was run once; for the seven variables it reads, the listen-state sequence and a single
 monitor window it gave the same results as the test firmware (it runs no scans). Every run, test
@@ -255,10 +256,12 @@ and commands then time out. That issue predates the firmware image used here.
   30 in three arranged differently (one of them with no listen state); one 6 s window counted 23
   (below). Several used the upstream driver plus the patch, without Bluetooth. All frames on the data channel are counted, of any kind,
   from the moment the monitor command's reply arrives; frames before that are not in the count.
+  (Later runs put the burst itself at exactly 30; see "What the limit is" below.)
 - **After that, about one frame arrived per command the host sent** `[board ×4]`. In eleven later
   phases with monitor on, the frame count equalled the number of commands sent in the phase in nine
   and was off by one in two; most phases had three commands and three frames. Commands were the only thing the host sent in those
   phases, so this does not separate "per command" from "per anything the host sends".
+  (Since separated: a plain data packet does the same; below.)
 - **Commands then stop getting through** `[board ×5]`. Three trials of the test firmware ended with a
   command that never returned, and the board was reset by its watchdog (Bluetooth was still being
   serviced each time). A fourth run, without Bluetooth, stopped at the first command after the burst,
@@ -296,7 +299,7 @@ and commands then time out. That issue predates the firmware image used here.
   frozen credit byte; the first window again counted 32, and that run's second window never
   reported (not investigated). The pool was not read in these runs. Not
   tried: a host driver other than embassy's on this board, a data packet from the host in place of a
-  command, and the probe switched off.
+  command (since tried, below), and the probe switched off.
 - **The firmware's own free-buffer figure falls to 4 of 50** `[board ×1, no Bluetooth]`. whd's header
   defines two named variables, `counters` and `memuse`, that none of the drivers read here (embassy, the c-driver, whd, linux) calls;
   this build answers both. They are ordinary run-time queries by name, like any other variable in §3.
@@ -310,7 +313,8 @@ and commands then time out. That issue predates the firmware image used here.
   all (`allmulti`, then SetMonitor, then no commands for 15 s) 30 frames arrived and `memuse` went
   from 17 of 50 to 4 of 50. (Without Bluetooth the figure is 17 at start-up and read 33 once the listen
   state was set up; with Bluetooth it read 17 before monitor with the listen state set up.) The figure does not count delivered frames: it fell by 13 for 30 frames here and by 29 for 32
-  frames above, and ended at 4 both times. Why 4, and where the other buffers are, is not known.
+  frames above, and ended at 4 both times. (Measured since: it falls one per frame until it reaches 4,
+  and delivery continues; below.) Why 4, and where the other buffers are, is not known.
 - **The figure stays at 4 of 50** `[board ×1, three rounds, no Bluetooth]`. Switching monitor off,
   `allmulti` off, the listen state off and discovery off, running a scan and waiting 5 s left it at
   4 of 50 at every step, and through two further rounds. Later monitor sessions in that boot delivered 4
@@ -335,19 +339,137 @@ and commands then time out. That issue predates the firmware image used here.
   restarted; later sessions deliver a few frames. The burst and the figure were seen with and without
   Bluetooth and with and without the listen state. Measured only with the listen state set up: the
   firmware's out-of-buffer and overflow counters rising across the burst, and the send-limit byte
-  staying at one value while monitor is on. Not established: where the buffers are; that the frames
-  handed to the host are what holds them (the figure does not track the frame count); why the burst
-  is 30 to 32 whatever the starting figure; whether the low pool causes the stall or both follow from
+  staying at one value while monitor is on. Not established: where the buffers are; why the figure does not recover once frames have been delivered; why the burst
+  is 30 whatever the starting figure; whether the low pool causes the stall or both follow from
   something else, such as a queue toward the host that stops moving; and whether some host action
-  none of those drivers shows would release it. Two further readings, not shown: scans returning
+  none of those drivers shows would release it (a host packet releases one frame within the send
+  credit, below; nothing found raises the credit). Two further readings, not shown: scans returning
   nothing while monitor is on fits there being no buffer for a result event; the action-frame events
   at switch-off (§8) fit something being released then. Of the hangs, one was the host running out of
-  send credit and one was host-side; the others have no recorded cause.
+  send credit and one was host-side; the others have no recorded cause. The measurements added
+  below ("What the limit is, and what moves it") refine this paragraph: the burst is 30, the figure
+  falls one per delivered frame until it reaches 4, and each host packet lets one more frame out
+  within the send credit. They do not explain any of it.
 - **A host-side trap** `[board ×1]`: monitor mode can deliver frames longer than an Ethernet frame
   (one of 1574 bytes was seen). A driver whose receive path assumes Ethernet-sized packets must be
   checked for that before using monitor mode.
 - **No signal strength or channel comes with a frame** `[board ×4]`. That needs the nexmon firmware patch
   (GPL-3.0, for the Wi-Fi-only 7.95.49 build).
+
+### What the limit is, and what moves it (added 2026-11-22)
+
+Eight further boots on the same board. Five ran a test firmware with Bluetooth running, one boot per
+bullet marked `[board ×1, … rounds]` below (settings; the 40-round burst run; host actions and the pool
+readings, one boot; packets past the limit; the pump); in those the radio was restarted in place after
+every round, so each round ("round" = one monitor session) starts from freshly loaded firmware. The
+build comparison is a separate example program without Bluetooth, one boot per image. Channel and
+listen state are given per bullet. The driver in these boots reads the bus when the radio raises its
+interrupt line and after each packet it sends; the status-sampling probe of the patches ran in
+the host-action rounds, the limit boot and the three build-comparison boots, and did not read packets. **None of this can be reproduced from the repository as it stands** (see "Code" at the
+end of the list).
+
+- **No setting tried, once each, changed the outcome** `[board ×1, seven rounds]`. Without the listen
+  state: `mpc` (reads 1; set to 0 and read back as 0), SetMonitor values 2 and 3 (each accepted and
+  read back), and `mpc` 0 with value 3 each gave 30 frames in the first 15 s, 1 in the next 15 s
+  and `memuse` 17 → 4 of 50, the same as the two control rounds. With `mpc` 0 and the listen state
+  on channel 6: 32 and 4 (the listen state's own commands account for the extra frames, below).
+  Frames looked the same with values 2 and 3 (beginning at the frame-control field), so nothing
+  here shows the firmware treats them differently from 1. `mpc` governs radio power-down when
+  idle and was a weak candidate.
+- **Two other released builds gave the same burst and pool figures, once each**
+  `[board ×1 each, no Bluetooth, no listen state]`. The same program was run with three images as
+  published (the c-driver's converted from its C-array form to a binary file, otherwise unaltered),
+  each with the regulatory table published beside it and the same board configuration file, each
+  reporting its own version and build date through `ver`: 7.95.61 (abcd531 CY, January 2023, the
+  build used everywhere else in these notes, from embassy's `cyw43-firmware`), 7.95.49 (2271bb6 CY,
+  November 2021, from the c-driver's `w43439A0_7_95_49_00_combined.h` at `fa9627e`) and 7.95.75
+  (0a0104c CY, November 2023, `cyfmac43439-sdio.bin` from `RPi-Distro/firmware-nonfree`, branch
+  `trixie`). Each: `memuse` 17 of 50, 30 frames in 15 s, 4 of 50, 1 frame in the next
+  15 s; then, with monitor switched off, a scan returned results. Nothing else in this subsection
+  was run on the other two builds.
+- **The burst was 30 frames in 40 of 40 rounds, whatever the frames' size**
+  `[board ×1, 40 rounds, listen state on channel 11]` (14 to 1,404 bytes seen; at most four
+  1,404-byte frames in one burst). 30 frames arrived within 66 to 485 ms of the monitor command
+  being sent (median about 268 ms) and then none until one more arrived with the next command, 4 s
+  later. During these rounds a second radio on the same channel transmitted marked broadcast data
+  frames of 60, 400 and 1,400 bytes at 5 to 200 a second, in timed phases; up to 19 of a round's
+  first 30 frames were its frames. Control frames of 14 bytes and data frames of 1,404 bytes each
+  counted as one; the bytes in a burst of 30 ranged from 2,228 to 13,192. `memuse` read 17 before
+  and 4 after in every round. Shorter bursts also occur: 29 in one of the 18 host-action rounds
+  below, a 15 s window of 29 in the pump run, and the 23 and 7 above; unexplained. The earlier
+  counts of 32 fit 30 plus the two listen commands sent after the burst in each 15 s window (the
+  first listen command goes out during the burst); the earlier 31 is not accounted for, and those
+  trials did not log their host traffic per window.
+- **Each command or small data packet the host sent was followed by exactly one more frame**
+  `[board ×1, 18 rounds, listen state on channel 11]`. After the burst, five actions 150 ms apart,
+  three rounds of each:
+
+  | Host action | Frames that arrived |
+  |---|---|
+  | none | 0, 0, 0 |
+  | five 4-byte read commands | 5, 5, 6 |
+  | five small write commands | 5, 5, 5 |
+  | five reads of `memuse` (512-byte reply buffer) | 5, 5, 5 |
+  | five 60-byte data packets (broadcast, an experimental ethertype) | 5, 5, 5 |
+  | ten such data packets | 10, 10, 10 |
+
+  (In the round that shows 6, the burst had counted 29; and one pump round below brought 12 frames
+  for 15 packets. So: 17 of these 18 rounds matched exactly.) A data packet gets no command reply,
+  so the frame is not carried out by one; whether the firmware returns some other packet for it was
+  not recorded. The driver reads the bus after every packet it sends, so a frame merely waiting for
+  a read would look the same; against that, the "none" rounds delivered nothing although the driver
+  reads whenever the radio raises its interrupt, reads forced on a timer delivered nothing extra in
+  an earlier run ("Nothing was left waiting on the bus", above), and in the next bullet thousands
+  of sends, each followed by a read, brought no frames once the limit was passed. It is not
+  "anything the host does" either: the mailbox poke above brought no data frames. The data
+  packets used send credit: the driver's sequence number rose by one per packet while the
+  firmware's limit stayed where it was.
+- **Packets sent past the frozen limit released nothing** `[board ×1, eight rounds, listen state on
+  channel 11]`. At the end of a burst the limit was 16 ahead of the driver's sequence number (40
+  against 24; 41 against 25 in one round). With the driver told to ignore the limit, 60 packets
+  queued at 20 ms intervals (two rounds), 300 at 5 ms (two), 1,000 back to back (two) and 4,000 at
+  5 ms (one) each let out exactly 16 frames. The credit byte stayed at one value in every header
+  the firmware sent meanwhile (21 to 371 per round: the 16 frames plus headers whose kind was not
+  recorded; the control round saw none). In the longer
+  rounds the driver's 8-bit sequence number wrapped and re-used numbers inside the limit without
+  releasing more frames, so the firmware is not simply admitting any packet whose number is inside
+  the window; whether it discards the rest by sequence number or has 16 receive slots that are
+  never refilled is not shown. A command written to the bus afterwards, itself numbered outside the
+  16 the firmware had admitted, got no reply within 3 s in all seven rounds; that is the same refusal, not a separate
+  failure. The radio restart recovered every time. The control round (no packets) delivered 0
+  frames and its command was answered.
+- **So in these controlled rounds a session delivered 30 frames, then one per host packet until the
+  send credit left at the end of the burst was used up (16 in these runs): 46 at most.** With the
+  pump below: 46, 46, 46 and 41. This describes most rounds, not all: see the short bursts and the
+  unequal rounds noted above and below. (46 is also the pool's 50 less the 4 it never goes below, but the pool had only 17
+  free at the start; treat that as coincidence unless shown otherwise.)
+- **The free-buffer figure falls one per delivered frame until it reaches 4, and delivery then
+  continues** `[board ×1, 18 rounds, same boot as the host-action rounds]`. One `memuse` read at a
+  set time after the monitor command: with 3 frames delivered it read 14; with 7, 10; with 8 to
+  10, 7 to 9; with 11, 6; with 13 or more, 4. Delivery then went on to 30 with the figure at 4. A
+  read made while 13 or fewer frames had been delivered did not add a frame (eight rounds, total
+  30); a read made with 18 to 28 delivered, or after the burst, added one (ten rounds, total 31).
+  So the figure fell by one for each of the first 13 frames, from a start of 17, and did not recover;
+  whether those buffers are the delivered frames' own is not shown. This was measured from that
+  start only (from 33, without Bluetooth, the figure had fallen by 29 over
+  a window of 32 frames, above). With a start of 17 the 30-frame limit is not the figure reaching 4.
+- **The restart workaround, with a pump** `[board ×1, four rounds, listen state on channel 6]`.
+  Before each restart the driver sent up to 16 of the 60-byte data packets, keeping to the send
+  limit: 13 to 15 were sent and the rest were held back by the limit (the same commands preceded the
+  pump each round, so why the number varied was not looked into). Frames per session: 46, 46, 46
+  and 41 (in the first three, one frame more than packets, probably the preceding `memuse` read's); the 15 s windows before the pump had counted 32, 31, 31 and 29. In the fourth round 15
+  packets brought 12 frames; not looked into. Restart and `memuse` were as before (about 1.6 s with
+  the Wi-Fi setup; 17 → 4 → 17). The pump uses up the send credit, which is the state in which
+  commands hang (above), so it is only of use immediately before a restart.
+- **What these runs do not show:** why the free-buffer figure does not recover; why 30; anything
+  on a second board; the per-packet rule or the limit on the other two builds. The test
+  transmitter's frames were identified by their transmitter address in the frames the board
+  delivered; the transmitting interface did not report its own transmissions.
+- **Code.** These runs used a local test firmware, a script for the second radio, and driver hooks
+  that are not among the ten patches: a count of frames carrying a marker address, a request to
+  send small data packets, a switch to ignore the send limit, and the restart-with-pump loop. The
+  build comparison used a variant of the `wifi_downup` example that reads its image from another
+  file. Until those are published, this subsection is a report, not something a reader can rerun.
 
 ### Example: Wi-Fi Aware publish frames
 
@@ -424,13 +546,15 @@ function to become ready, interrupt enables) are left out. Read `runner.rs` for 
 
 ## 11. Open questions
 
-- Why the firmware's free-buffer figure drops to 4 of 50 in monitor mode and stays there, and whether
-  that is the cause of the stall (§7); whether the firmware's packet filters apply in monitor mode,
+- Why the firmware's free-buffer figure drops to 4 of 50 in monitor mode and stays there, and why the
+  burst is 30 (§7; most controlled rounds followed one pattern, 30 frames and then one per host packet
+  until the send credit left at the end of the burst is used, but nothing explains it); whether the firmware's packet filters apply in monitor mode,
   so a burst could hold only wanted frames; and why some bursts stop short.
 - Whether any configuration keeps action-frame events (59 / 75) coming (see the untried list in §8).
 - Whether the device can be kept from transmitting in the listen state.
 - Whether events above code 127 can be enabled, given the 16-byte mask read-back.
-- All of the above on a second board, on a Pico W (RP2040), and on the 7.95.49 build.
+- All of the above on a second board, on a Pico W (RP2040), and on the 7.95.49 build (only the
+  burst and pool figures have been measured on 7.95.49 and 7.95.75, once each; §7).
 
 ## Privacy
 
