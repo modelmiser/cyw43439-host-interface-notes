@@ -1,0 +1,173 @@
+From 6f640d54ee3995babfb57310a489a8cb767704cf Mon Sep 17 00:00:00 2001
+From: Chad Aldreda <ca@modelmiser.com>
+Date: Sun, 22 Nov 2026 05:43:34 -0800
+Subject: [PATCH] wifi_knob_sweep: settings written while down, bus:rxglom left
+ out, bytes before each frame, dump detail
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ cyw43/src/diag.rs                          | 18 +++++++++
+ cyw43/src/runner.rs                        |  5 +++
+ examples/rp235x/src/bin/wifi_knob_sweep.rs | 43 +++++++++++++++++++---
+ 3 files changed, 60 insertions(+), 6 deletions(-)
+
+diff --git a/cyw43/src/diag.rs b/cyw43/src/diag.rs
+index 04e4bf457..d6c1524c9 100644
+--- a/cyw43/src/diag.rs
++++ b/cyw43/src/diag.rs
+@@ -545,12 +545,18 @@ pub struct DiagRxMeta {
+     pub with_offset: u32,
+     /// The last header: flags, priority, flags2, data offset.
+     pub last: [u8; 4],
++    /// For the first eight frames: the bytes between the header and the frame (up to 8 kept).
++    pub extra: [[u8; 8]; 8],
++    /// How many of `extra` are filled.
++    pub extras: usize,
+ }
+ 
+ static RX_META: Mutex<CriticalSectionRawMutex, Cell<DiagRxMeta>> = Mutex::new(Cell::new(DiagRxMeta {
+     by_interface: [0; 8],
+     with_offset: 0,
+     last: [0; 4],
++    extra: [[0; 8]; 8],
++    extras: 0,
+ }));
+ 
+ pub(crate) fn rx_meta(header: [u8; 4]) {
+@@ -566,6 +572,18 @@ pub(crate) fn rx_meta(header: [u8; 4]) {
+     })
+ }
+ 
++pub(crate) fn rx_extra(bytes: &[u8]) {
++    RX_META.lock(|m| {
++        let mut v = m.get();
++        if v.extras < 8 {
++            let n = bytes.len().min(8);
++            v.extra[v.extras][..n].copy_from_slice(&bytes[..n]);
++            v.extras += 1;
++            m.set(v);
++        }
++    })
++}
++
+ /// Take and reset the frame-header counts.
+ pub fn diag_rx_meta_take() -> DiagRxMeta {
+     RX_META.lock(|m| m.replace(DiagRxMeta::default()))
+diff --git a/cyw43/src/runner.rs b/cyw43/src/runner.rs
+index cd8e3ab1e..f80cac2f2 100644
+--- a/cyw43/src/runner.rs
++++ b/cyw43/src/runner.rs
+@@ -1497,6 +1497,11 @@ impl<'a, BUS: Bus, CHIP: Chip> Runner<'a, BUS, CHIP> {
+                 None
+             }
+             CHANNEL_TYPE_DATA => {
++                // Diagnostic: the bytes between the BDC header and the frame, which the parse skips.
++                if payload.len() >= BdcHeader::SIZE {
++                    let extra = (4 * payload[3] as usize).min(payload.len() - BdcHeader::SIZE);
++                    crate::diag::rx_extra(&payload[BdcHeader::SIZE..BdcHeader::SIZE + extra]);
++                }
+                 let Some((bdc, packet)) = BdcHeader::parse(payload) else {
+                     return None;
+                 };
+diff --git a/examples/rp235x/src/bin/wifi_knob_sweep.rs b/examples/rp235x/src/bin/wifi_knob_sweep.rs
+index f1d979831..273c3ed6e 100644
+--- a/examples/rp235x/src/bin/wifi_knob_sweep.rs
++++ b/examples/rp235x/src/bin/wifi_knob_sweep.rs
+@@ -7,6 +7,9 @@
+ //!    burst, the figure's fall to 4, or the one-frame-per-host-packet rule;
+ //! 3. in every round, the interface number in each delivered frame's 4-byte BDC header.
+ //!
++//! `bus:rxglom` is left out: this firmware accepts it and from then on expects a different framing
++//! from the host, so the next command is discarded and the program would wait for ever.
++//!
+ //! Only settings that a restart undoes are written. A round whose numbers differ from the plain
+ //! sequence (30 frames, figure 4, 5 frames for 5 commands) is marked `<<<`.
+ 
+@@ -132,6 +135,9 @@ enum Knob {
+     Var(&'static str, u32),
+     /// Write bytes to a named variable.
+     Bytes(&'static str, &'static [u8]),
++    /// Take the interface down, write a 32-bit value to a named variable, bring it up again (for
++    /// settings the firmware refuses while up), before the listen state is set up.
++    DownVar(&'static str, u32),
+     /// The power-save mode (command 86).
+     Pm(u32),
+     /// The promiscuous setting (command 10).
+@@ -142,7 +148,6 @@ const KNOBS: &[(&str, Knob)] = &[
+     ("control", Knob::None),
+     ("no allmulti", Knob::NoAllmulti),
+     ("bus:txglom 1", Knob::Var("bus:txglom", 1)),
+-    ("bus:rxglom 1", Knob::Var("bus:rxglom", 1)),
+     ("bus:txglomalign 4", Knob::Var("bus:txglomalign", 4)),
+     ("ampdu_hostreorder 1", Knob::Var("ampdu_hostreorder", 1)),
+     ("ampdu_rx 0", Knob::Var("ampdu_rx", 0)),
+@@ -168,6 +173,13 @@ const KNOBS: &[(&str, Knob)] = &[
+     ("pm2_sleep_ret 10", Knob::Var("pm2_sleep_ret", 10)),
+     ("wd_disable 1", Knob::Var("wd_disable", 1)),
+     ("apsta 0", Knob::Var("apsta", 0)),
++    ("ampdu_hostreorder 1, set while down", Knob::DownVar("ampdu_hostreorder", 1)),
++    ("ampdu_rx 0, set while down", Knob::DownVar("ampdu_rx", 0)),
++    ("ampdu_rx_factor 0, set while down", Knob::DownVar("ampdu_rx_factor", 0)),
++    ("nmode 0, set while down", Knob::DownVar("nmode", 0)),
++    ("mimo_bw_cap 1, set while down", Knob::DownVar("mimo_bw_cap", 1)),
++    ("apsta 0, set while down", Knob::DownVar("apsta", 0)),
++    ("down and up only", Knob::DownVar("mpc", 1)),
+     ("event_msgs none", Knob::Bytes("event_msgs", &[0; 24])),
+     ("power-save 0", Knob::Pm(0)),
+     ("power-save 2", Knob::Pm(2)),
+@@ -184,7 +196,12 @@ async fn dump(control: &mut cyw43::Control<'static>, when: &str, sub: &str) {
+     let (status, len) = control.diag_get_iovar_param("dump", sub.as_bytes(), &mut buf[..]).await;
+     let end = len.min(1024);
+     let n = buf[..end].iter().position(|c| *c == 0).unwrap_or(end);
+-    info!("1 dump \"{}\" {}: status {} len {} text bytes {}", sub, when, status, len, n);
++    let nonzero = buf[..end].iter().filter(|c| **c != 0).count();
++    let first = buf[..end].iter().position(|c| *c != 0).unwrap_or(0);
++    info!(
++        "1 dump \"{}\" {}: status {} len {} text bytes {} | non-zero bytes {} first at {} | {=[u8]:02x}",
++        sub, when, status, len, n, nonzero, first, buf[first.min(end)..(first + 32).min(end)]
++    );
+     for chunk in buf[..n.min(600)].chunks(120) {
+         info!("    {=[u8]:a}", chunk);
+     }
+@@ -258,13 +275,26 @@ async fn main(spawner: Spawner) {
+ 
+     // 2 and 3. The knob sweep.
+     for (name, knob) in KNOBS {
+-        // The listen state first, with allmulti (park sets it); then the knob.
++        let (mut set, mut readback) = (0i32, 0u32);
++        if let Knob::DownVar(var, value) = *knob {
++            let down = control.diag_updown(false).await;
++            set = control.diag_set_iovar(var, &value.to_le_bytes()).await;
++            let up = control.diag_updown(true).await;
++            let mut res = [0u8; 4];
++            let _ = control.diag_get_iovar(var, &mut res).await;
++            readback = u32::from_le_bytes(res);
++            info!("    down {} set {} up {}", down, set, up);
++        }
++        // The listen state, with allmulti (park sets it); then the other knobs.
+         if !park(&mut control, CH11).await {
+-            return;
++            warn!("round {} skipped: the listen state could not be set up", name);
++            if !restart(&mut control, fw, nvram, clm).await {
++                return;
++            }
++            continue;
+         }
+-        let (mut set, mut readback) = (0i32, 0u32);
+         match *knob {
+-            Knob::None => {}
++            Knob::None | Knob::DownVar(..) => {}
+             Knob::NoAllmulti => {
+                 set = control.diag_set_allmulti(false).await;
+             }
+@@ -310,6 +340,7 @@ async fn main(spawner: Spawner) {
+             burst.firsts[..n], burst.sizes[..n], meta.by_interface, meta.with_offset, meta.last,
+             if odd { "<<<" } else { "" }
+         );
++        info!("    bytes between the header and the frame, first frames: {=[u8]:02x} {=[u8]:02x} {=[u8]:02x} {=[u8]:02x}", meta.extra[0], meta.extra[1], meta.extra[2], meta.extra[3]);
+         console("knob");
+         if !restart(&mut control, fw, nvram, clm).await {
+             return;
+-- 
+2.43.0
+

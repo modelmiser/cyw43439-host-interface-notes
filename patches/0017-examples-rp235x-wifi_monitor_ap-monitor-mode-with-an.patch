@@ -1,0 +1,328 @@
+From 94d83b7090cebcc8e37d22a2691e1a4fc750bbde Mon Sep 17 00:00:00 2001
+From: Chad Aldreda <ca@modelmiser.com>
+Date: Sun, 22 Nov 2026 06:31:03 -0800
+Subject: [PATCH] =?UTF-8?q?examples/rp235x:=20wifi=5Fmonitor=5Fap=20?=
+ =?UTF-8?q?=E2=80=94=20monitor=20mode=20with=20an=20access=20point=20start?=
+ =?UTF-8?q?ed?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ examples/rp235x/src/bin/wifi_monitor_ap.rs | 303 +++++++++++++++++++++
+ 1 file changed, 303 insertions(+)
+ create mode 100644 examples/rp235x/src/bin/wifi_monitor_ap.rs
+
+diff --git a/examples/rp235x/src/bin/wifi_monitor_ap.rs b/examples/rp235x/src/bin/wifi_monitor_ap.rs
+new file mode 100644
+index 000000000..9df7728c7
+--- /dev/null
++++ b/examples/rp235x/src/bin/wifi_monitor_ap.rs
+@@ -0,0 +1,303 @@
++//! Monitor mode with an access point started on the radio, without Bluetooth: does the stall look
++//! any different when the firmware is running an access point (beaconing, with its own transmit
++//! path active) instead of sitting idle? The radio is restarted in place after every round.
++//!
++//! Rounds: the plain sequence with the listen state (control); the access point alone; the access
++//! point and then monitor mode, for 30 s; the access point closed again while monitor is on, and
++//! before monitor is switched on; monitor switched off; monitor first and then the access point.
++//! Each window reports the frames delivered with no host activity, by kind, and the free-buffer
++//! figure is read around them.
++//!
++//! The access point is open, is named `pico-monitor-test`, has nothing behind it, and is up for
++//! up to about 35 s per round.
++
++#![no_std]
++#![no_main]
++
++use cyw43::aligned_bytes;
++use cyw43_pio::{PioSpi, RM2_CLOCK_DIVIDER};
++use defmt::*;
++use defmt_rtt as _;
++use embassy_executor::Spawner;
++use embassy_rp::gpio::{Level, Output};
++use embassy_rp::peripherals::{DMA_CH0, DMA_CH1, PIO0};
++use embassy_rp::pio::{InterruptHandler, Pio};
++use embassy_rp::{bind_interrupts, dma};
++use embassy_futures::select::{Either, select};
++use embassy_time::Timer;
++use panic_probe as _;
++use static_cell::StaticCell;
++
++bind_interrupts!(struct Irqs {
++    PIO0_IRQ_0 => InterruptHandler<PIO0>;
++    DMA_IRQ_0 => dma::InterruptHandler<DMA_CH0>, dma::InterruptHandler<DMA_CH1>;
++});
++
++#[embassy_executor::task]
++async fn cyw43_task(
++    runner: cyw43::Runner<'static, cyw43::SpiBus<Output<'static>, PioSpi<'static, PIO0, 0>>, cyw43::Cyw43439>,
++) -> ! {
++    runner.run().await
++}
++
++/// The "N" of the firmware's "Packet pool: N of M available" line, or -1.
++async fn pool(control: &mut cyw43::Control<'static>) -> i32 {
++    static mut BUF: [u8; 512] = [0; 512];
++    // SAFETY: single task, used sequentially.
++    #[allow(static_mut_refs)]
++    let buf = unsafe { &mut BUF };
++    let (status, len) = control.diag_get_iovar_buf("memuse", &mut buf[..]).await;
++    if status != 0 {
++        return -1;
++    }
++    let text = &buf[..len.min(512)];
++    let key = b"Packet pool: ";
++    let Some(at) = text.windows(key.len()).position(|w| w == key) else {
++        return -1;
++    };
++    let mut n = 0i32;
++    let mut any = false;
++    for c in &text[at + key.len()..] {
++        if c.is_ascii_digit() {
++            n = n * 10 + (*c - b'0') as i32;
++            any = true;
++        } else {
++            break;
++        }
++    }
++    if any { n } else { -1 }
++}
++
++/// Set up the Wi-Fi Direct listen state on `chanspec` with a 60 s dwell, and allmulti.
++async fn park(control: &mut cyw43::Control<'static>, chanspec: u16) -> bool {
++    let mut addr = control.address().await;
++    addr[0] |= 0x02;
++    let _ = control.diag_set_iovar("p2p_disc", &0u32.to_le_bytes()).await;
++    let _ = control.diag_set_iovar("p2p_da_override", &addr).await;
++    let s2 = control.diag_set_iovar("p2p_disc", &1u32.to_le_bytes()).await;
++    Timer::after_millis(500).await;
++    let mut res = [0u8; 16];
++    let (s3, _) = control.diag_get_iovar("p2p_dev", &mut res).await;
++    let idx = u32::from_le_bytes([res[0], res[1], res[2], res[3]]);
++    if s2 != 0 || s3 != 0 || idx > 15 {
++        warn!("listen setup failed: disc1 {} p2p_dev {} idx {}", s2, s3, idx);
++        return false;
++    }
++    let mut v = [0u8; 10];
++    v[..4].copy_from_slice(&idx.to_le_bytes());
++    let _ = control.diag_set_iovar("bsscfg:p2p_state", &v).await;
++    let _ = control.diag_set_allmulti(true).await;
++    v[4] = 1;
++    v[6..8].copy_from_slice(&chanspec.to_le_bytes());
++    v[8..10].copy_from_slice(&60000u16.to_le_bytes());
++    control.diag_set_iovar("bsscfg:p2p_state", &v).await == 0
++}
++
++/// Power-cycle the radio in place, load the firmware again and redo the Wi-Fi setup.
++async fn restart(
++    control: &mut cyw43::Control<'static>,
++    fw: &'static cyw43::Aligned<cyw43::A4, [u8]>,
++    nvram: &'static cyw43::Aligned<cyw43::A4, [u8]>,
++    clm: &[u8],
++) -> bool {
++    cyw43::diag_ignore_credit(false);
++    let _ = cyw43::diag_data_sent();
++    let (done, failed, _) = cyw43::diag_restart_result();
++    cyw43::diag_request_restart(fw, nvram);
++    for _ in 0..1000 {
++        Timer::after_millis(20).await;
++        let (d, f, ms) = cyw43::diag_restart_result();
++        if f != failed {
++            warn!("restart FAILED after {} ms", ms);
++            return false;
++        }
++        if d != done {
++            control.init(clm, cyw43::Config::default()).await;
++            return true;
++        }
++    }
++    warn!("restart did not finish");
++    false
++}
++
++/// Channel 11, 20 MHz, 2.4 GHz.
++const CH11: u16 = 0x100b;
++const SSID: &str = "pico-monitor-test";
++
++#[derive(Clone, Copy, PartialEq)]
++enum Mode {
++    /// The listen state, then monitor: the control.
++    Listen,
++    /// Access point up, then monitor; six 5 s windows.
++    ApThenMonitor,
++    /// Monitor, then the access point.
++    MonitorThenAp,
++    /// Access point up and no monitor mode at all.
++    ApOnly,
++    /// Access point up, monitor on, then the access point closed with monitor still on.
++    ApMonitorCloseAp,
++    /// Access point up and closed again, then monitor.
++    ApClosedThenMonitor,
++    /// Access point up, monitor on, then monitor off.
++    ApMonitorOff,
++}
++
++/// Print what one window delivered: count, bytes, the frame kinds seen, and the first frames'
++/// first byte and length.
++fn window(name: &str, what: &str) {
++    let rx = cyw43::diag_rx_take();
++    let b = cyw43::diag_bus_take();
++    let mut kinds = [0u8; 12];
++    let mut counts = [0u32; 12];
++    let mut n = 0;
++    for (k, c) in rx.kinds.iter().enumerate() {
++        if *c > 0 && n < 12 {
++            // Back to the frame-control low byte with the version bits zero.
++            kinds[n] = (k as u8) << 2;
++            counts[n] = *c;
++            n += 1;
++        }
++    }
++    let m = (rx.frames as usize).min(10);
++    info!(
++        "{} | {}: frames {} bytes {} | by first byte {=[u8]:02x} counts {} | first frames: bytes {=[u8]:02x} lengths {} | seq/limit {}/{}",
++        name, what, rx.frames, rx.bytes, kinds[..n], counts[..n], rx.firsts[..m], rx.sizes[..m], b.seq, b.seq_max
++    );
++}
++
++async fn round(control: &mut cyw43::Control<'static>, name: &str, mode: Mode) -> bool {
++    match mode {
++        Mode::Listen => {
++            if !park(control, CH11).await {
++                return false;
++            }
++        }
++        Mode::MonitorThenAp => {
++            let _ = control.diag_set_allmulti(true).await;
++        }
++        _ => {
++            control.start_ap_open(SSID, 11).await;
++            Timer::after_millis(1000).await;
++            let _ = control.diag_set_allmulti(true).await;
++        }
++    }
++    if mode == Mode::ApClosedThenMonitor {
++        control.close_ap().await;
++        Timer::after_millis(500).await;
++    }
++    let before = pool(control).await;
++    Timer::after_millis(300).await;
++    let _ = cyw43::diag_rx_take();
++    let _ = cyw43::diag_bus_take();
++    if mode == Mode::ApOnly {
++        Timer::after_millis(5000).await;
++        window(name, "5 s, no monitor mode");
++        let after = pool(control).await;
++        info!("{} | pool {} -> {}", name, before, after);
++        return true;
++    }
++    let (ms, _) = control.diag_monitor(Some(1)).await;
++    if mode == Mode::MonitorThenAp {
++        control.start_ap_open(SSID, 11).await;
++    }
++    Timer::after_millis(1000).await;
++    window(name, "first 1 s of monitor");
++    let after = pool(control).await;
++    info!("{} | monitor status {} | pool {} -> {}", name, ms, before, after);
++    match mode {
++        Mode::ApThenMonitor => {
++            for _ in 0..6 {
++                Timer::after_millis(5000).await;
++                window(name, "5 s, no host activity");
++            }
++        }
++        Mode::ApMonitorCloseAp => {
++            Timer::after_millis(2000).await;
++            window(name, "2 s more");
++            control.close_ap().await;
++            let _ = cyw43::diag_rx_take();
++            Timer::after_millis(5000).await;
++            window(name, "5 s after the access point was closed, monitor still on");
++        }
++        Mode::ApMonitorOff => {
++            Timer::after_millis(2000).await;
++            window(name, "2 s more");
++            let (off, _) = control.diag_monitor(Some(0)).await;
++            let _ = cyw43::diag_rx_take();
++            Timer::after_millis(5000).await;
++            window(name, "5 s after monitor was switched off");
++            info!("{} | monitor off status {}", name, off);
++        }
++        _ => {
++            Timer::after_millis(5000).await;
++            window(name, "5 s, no host activity");
++        }
++    }
++    let end = pool(control).await;
++    info!("{} | pool at the end {}", name, end);
++    true
++}
++
++#[embassy_executor::main(executor = "embassy_rp::executor::Executor", entry = "cortex_m_rt::entry")]
++async fn main(spawner: Spawner) {
++    let p = embassy_rp::init(Default::default());
++    let fw = aligned_bytes!("../../../../cyw43-firmware/43439A0.bin");
++    let clm = aligned_bytes!("../../../../cyw43-firmware/43439A0_clm.bin");
++    let nvram = aligned_bytes!("../../../../cyw43-firmware/nvram_rp2040.bin");
++
++    let pwr = Output::new(p.PIN_23, Level::Low);
++    let cs = Output::new(p.PIN_25, Level::High);
++    let mut pio = Pio::new(p.PIO0, Irqs);
++    let spi = PioSpi::new(
++        &mut pio.common,
++        pio.sm0,
++        RM2_CLOCK_DIVIDER,
++        pio.irq0,
++        cs,
++        p.PIN_24,
++        p.PIN_29,
++        dma::Channel::new(p.DMA_CH0, Irqs),
++        dma::Channel::new(p.DMA_CH1, Irqs),
++    );
++
++    static STATE: StaticCell<cyw43::State> = StaticCell::new();
++    let state = STATE.init(cyw43::State::new());
++    let (_net_device, mut control, runner) = cyw43::new(state, pwr, spi, fw, nvram).await;
++    spawner.spawn(unwrap!(cyw43_task(runner)));
++    control.init(clm, cyw43::Config::default()).await;
++
++    cyw43::diag_bus_config(20, false);
++    Timer::after_secs(2).await;
++    let rounds: [(&str, Mode); 9] = [
++        ("control (listen state)", Mode::Listen),
++        ("access point only", Mode::ApOnly),
++        ("access point, then monitor", Mode::ApThenMonitor),
++        ("access point, monitor, access point closed", Mode::ApMonitorCloseAp),
++        ("access point up and closed, then monitor", Mode::ApClosedThenMonitor),
++        ("access point, monitor, monitor off", Mode::ApMonitorOff),
++        ("monitor, then access point", Mode::MonitorThenAp),
++        ("access point, then monitor", Mode::ApThenMonitor),
++        ("control (listen state)", Mode::Listen),
++    ];
++    for (name, mode) in rounds {
++        match select(round(&mut control, name, mode), Timer::after_secs(60)).await {
++            Either::First(true) => {}
++            Either::First(false) => warn!("{}: setup failed", name),
++            Either::Second(()) => {
++                let b = cyw43::diag_bus_take();
++                let rx = cyw43::diag_rx_take();
++                warn!(
++                    "{}: no reply to a command | frames since the last count {} | seq/limit {}/{} send stalls {}",
++                    name, rx.frames, b.seq, b.seq_max, b.tx_stalled
++                );
++            }
++        }
++        if !restart(&mut control, fw, nvram, clm).await {
++            return;
++        }
++    }
++    info!("done");
++    loop {
++        Timer::after_secs(60).await;
++    }
++}
+-- 
+2.43.0
+

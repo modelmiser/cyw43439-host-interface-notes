@@ -1,0 +1,44 @@
+From 86d87aa37127ab564ddfaf07571c3384aac727b7 Mon Sep 17 00:00:00 2001
+From: Chad Aldreda <ca@modelmiser.com>
+Date: Mon, 23 Nov 2026 09:28:37 -0800
+Subject: [PATCH] examples/rp235x: wifi_monitor_ap and wifi_monitor_sta header
+ comments list every round
+
+Comments only.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ examples/rp235x/src/bin/wifi_monitor_ap.rs  | 1 +
+ examples/rp235x/src/bin/wifi_monitor_sta.rs | 4 +++-
+ 2 files changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/examples/rp235x/src/bin/wifi_monitor_ap.rs b/examples/rp235x/src/bin/wifi_monitor_ap.rs
+index 9df7728c7..89fbf1cf0 100644
+--- a/examples/rp235x/src/bin/wifi_monitor_ap.rs
++++ b/examples/rp235x/src/bin/wifi_monitor_ap.rs
+@@ -5,6 +5,7 @@
+ //! Rounds: the plain sequence with the listen state (control); the access point alone; the access
+ //! point and then monitor mode, for 30 s; the access point closed again while monitor is on, and
+ //! before monitor is switched on; monitor switched off; monitor first and then the access point.
++//! Then the access point and monitor for 30 s a second time, and the control again.
+ //! Each window reports the frames delivered with no host activity, by kind, and the free-buffer
+ //! figure is read around them.
+ //!
+diff --git a/examples/rp235x/src/bin/wifi_monitor_sta.rs b/examples/rp235x/src/bin/wifi_monitor_sta.rs
+index 38fed6efd..ca9d0a2e1 100644
+--- a/examples/rp235x/src/bin/wifi_monitor_sta.rs
++++ b/examples/rp235x/src/bin/wifi_monitor_sta.rs
+@@ -6,7 +6,9 @@
+ //! the network: no address is requested.
+ //!
+ //! Rounds: the listen state and then monitor (control); join, then monitor, for 15 s; join, monitor,
+-//! then leave the network with monitor still on; join and monitor again; control again.
++//! then leave the network with monitor still on, twice over (in both runs on the author's board the
++//! round straight after a joined one did not finish joining and hit the 60 s round timeout, which
++//! prints "no reply to a command"); join and monitor again; control again.
+ 
+ #![no_std]
+ #![no_main]
+-- 
+2.43.0
+
