@@ -56,9 +56,9 @@ sequence with it, without Bluetooth, and produced the credit figures quoted in �
 consumes the driver's cached status word, so it adds bus traffic of its own, and it was running in
 every monitor-mode run reported here except those added on 2026-11-22 and 2026-11-23 (the last two
 subsections of §7), which say for themselves where the probe ran. Four further patches carry the hooks and examples for
-that subsection (`wifi_fw_compare`, `wifi_bus_watch`, `wifi_monitor_limit`, `wifi_keyhole_sweep`), and
+the subsection added on 2026-11-22 (`wifi_fw_compare`, `wifi_bus_watch`, `wifi_monitor_limit`, `wifi_keyhole_sweep`), and
 `tools/inject_test.py` is the script for its test transmitter. Patches 15 to 18 carry three more
-examples (`wifi_knob_sweep`, `wifi_monitor_ap`, `wifi_monitor_sta`) for the subsection added on
+examples (`wifi_knob_sweep`, `wifi_monitor_ap`, `wifi_monitor_sta`) and the driver hooks they need for the subsection added on
 2026-11-23, whose longer runs used the test firmware; patch 19 only completes two of their header
 comments. The first
 example (`wifi_interface_probe`), built against upstream embassy with only the patch and without
@@ -263,8 +263,8 @@ and commands then time out. That issue predates the firmware image used here.
   (below). Several used the upstream driver plus the patch, without Bluetooth. All frames on the data channel are counted, of any kind,
   from the moment the monitor command's reply arrives; frames before that are not in the count.
   (Later runs put the burst itself at exactly 30; see "What the limit is" below. With an access
-  point running on the radio, or a network joined, no stall was seen in runs of up to 24 hours; see
-  the subsection added on 2026-11-23.)
+  point running on the radio no stall was seen in runs of up to 30 s, 2 minutes and, once, 24
+  hours; nor with a network joined, over 15 s stretches; see the subsection added on 2026-11-23.)
 - **After that, about one frame arrived per command the host sent** `[board ×4]`. In eleven later
   phases with monitor on, the frame count equalled the number of commands sent in the phase in nine
   and was off by one in two; most phases had three commands and three frames. Commands were the only thing the host sent in those
@@ -543,15 +543,23 @@ host sent no command or data packet (in the examples the 20 ms bus probe ran, as
 controls). Frame totals for a timed stretch leave out the first second after monitor was switched
 on, which was counted separately. One board, one location, two days: the same caution as everywhere
 else in these notes. "Did not stall" below means: over the stretch measured, delivery went on past 30
-frames with no host activity and the free-buffer figure stayed at 17. The controls used the listen
-state and the other rounds did not; the like-for-like control is the round in which the access point
-was started and closed again before monitor, and earlier runs with no listen state stalled as well
-(above).
+frames with no host activity and the free-buffer figure stayed at 17. In the test-firmware
+runs the firmware's other work went on (Bluetooth, and scans in the 24-hour run), so there the test
+is the frame count and the figure only. The controls, and every round of the settings sweep, used
+the listen state; the access-point and joined-network rounds did not. The like-for-like control for
+the access point is the round in which it was started and closed again before monitor; there is no
+such control for the joined network. Earlier runs with no listen state stalled as well (above).
+embassy's `start_ap_open` (upstream, not in the patches) takes the interface down, sets `apsta` 0 and
+brings it up before starting the access point, and `close_ap` does the same with `apsta` 1; so the
+rounds that start or close an access point with monitor on include a down and up. The settings
+sweep's `apsta` 0 round and the started-and-closed round both stalled, so that cycle alone did not
+prevent the stall.
 
 - **No setting tried moved the limit** `[board ×1, 40 rounds, listen state on channel 11, no
   Bluetooth]`. One setting was written before each monitor session: 3 controls, one round that only
-  took the interface down and up, 28 with a setting in effect, and 8 where the write was refused.
-  Every round gave a burst of 30, the free-buffer figure 17 → 4, and 5 frames for 5 read commands.
+  took the interface down, wrote `mpc` 1 and brought it up, 28 where the write was accepted, and 8
+  where it was refused. Every round gave a burst of 30, the free-buffer figure 17 → 4, and 5 frames
+  for 5 read commands (one `memuse` read and four reads of the monitor setting).
   Accepted (status 0) but not read back: `allmulti` off, an empty event mask. Accepted and
   read back: `bus:txglomalign`, `ampdu_ba_wsize`, `ampdu_mpdu`, `tlv` 1 and 7,
   `pkt_filter_mode` 0, `arp_ol`, `arpoe`, `sgi_rx`, `intol40`, `mfp`, `roam_off`, `assoc_listen`,
@@ -573,16 +581,16 @@ was started and closed again before monitor, and earlier runs with no listen sta
   open access point on channel 11]`. In the boot of the example as published: access point up and
   then monitor, two rounds of 30 s, gave 12 quiet 5 s windows of 503 to 939 frames, with the
   free-buffer figure 17 before and 17 at the end; the send limit rose with each command, where it
-  stays frozen in the controls. An earlier version of
-  the example, one boot, gave the same in four shorter rounds: 132 to 180 frames in the first second,
+  stayed frozen in the controls. An earlier version of
+  the example, one boot, also kept delivering in four shorter rounds: 132 to 180 frames in the first second,
   75 to 117 during five commands, 638 to 793 in a further quiet 5 s; the figure was 17 at the end,
   except 13 in the round that switched monitor on before starting the access point (17 in the same
   round of the published version, below; not looked into). The frames are ordinary 802.11 traffic
-  (the example records up to twelve distinct first bytes per window, so a rare kind can be missing
-  from its list): about two thirds beacons (first byte `80`), then control frames (`94`,
+  (the example lists at most twelve kinds per window, dropping those with the highest first bytes
+  once twelve are present): about two thirds beacons (first byte `80`), then control frames (`94`,
   `b4`, `c4`, `d4`), probe responses (`50`), action frames (`d0`), probe requests (`40`), data (`08`,
   `88`) and a few others (`24`, `48`).
-- **The stall was absent only while the access point was up, whichever was started first** `[the same boot of the published
+- **The stall came back when the access point was closed, and was absent in either start order** `[the same boot of the published
   example, one round each]`. Access point alone, no monitor: 0 frames in 5 s. Monitor switched off
   with the access point up: 0 frames in the next 5 s, figure 17. Access point closed while monitor was
   on: 30 more frames in 5 s, figure 4, which is the stall. Access point started and closed before
@@ -609,11 +617,11 @@ was started and closed again before monitor, and earlier runs with no listen sta
   monitor on, a scan returned 13 results in 1.9 s; 29 frames were delivered during it and 80 in the
   next 5 s. In the hidden-access-point boot a scan returned 12 results in 1.9 s. This differs from "Scans returned nothing
   while it was on" (above), which was measured with no access point.
-- **With a hidden, WPA2-protected access point, also no stall** `[board ×1, test firmware, Bluetooth on,
+- **With a hidden, WPA2-protected access point: two rounds without a stall, later ones too quiet to judge** `[board ×1, test firmware, Bluetooth on,
   channel 6]`. The `closednet` variable set to 1 (status 0, read back 1), written before the access
   point was started in one round and after in another: 931 and 2,034 frames in 60 s, figure 17 at
   every check. The opening control gave 31 frames and 17 → 4. A second computer scanning every 17 s
-  or so listed the board's address on channel 6 with an empty network name in 11 of 16 scans, in
+  or so, over the whole boot of about four minutes, listed the board's address on channel 6 with an empty network name in 11 of 16 scans, in
   both orders, and never with its name; it did not list the board at all during the one 30 s round
   that was protected but not hidden, so nothing here shows the name being visible without
   `closednet`. (That computer's scan log was not kept; these counts are from notes made at the time.) Later in this boot reception thinned
@@ -623,7 +631,8 @@ was started and closed again before monitor, and earlier runs with no listen sta
   the frames that did arrive came from was not established. A frame count alone cannot tell a quiet
   channel from a stall. A figure still at 17 shows the buffers were not used up; it does not show
   why delivery fell. Closing this access
-  point with monitor on gave 8 frames in 5 s and the figure fell from 17 to 9.
+  point with monitor on gave 8 frames in 5 s and the figure fell from 17 to 9 (not the usual 30 and
+  4; not looked into).
 - **Twenty-four hours** `[board ×1, test firmware]`. The test firmware's normal work (Bluetooth
   scanning, a Wi-Fi scan about every two seconds) with a hidden WPA2 access point on channel 6 and
   monitor on, set up at boot and again after each radio restart. Once a minute it logged the frames
@@ -635,13 +644,13 @@ was started and closed again before monitor, and earlier runs with no listen sta
   after a bus fault the test firmware also shows without the access point and monitor mode, both
   recovered in place in about 0.8 s with the access point and monitor set up again. An earlier
   version of the test firmware without them had 2 such faults in its longest run, 31 hours; 2 in 24
-  hours cannot be told apart from that, so this run does not show the arrangement adding restarts,
+  hours cannot be told apart from that (one run each, on different versions), so this run does not show the arrangement adding restarts,
   and is too short to show that it does not.
   Over the 24 hours monitor delivered 585,615 beacons and the scans reported 585,622 results (two
   separate counters), which suggests the beacons monitor delivers are those of the scans, heard on
   the channels the radio visits while scanning; that was not checked further.
-- **What these runs do not show:** why a running access point or a joined network keeps the buffers
-  coming back (the firmware was not examined, and nothing a host can read was found that explains
+- **What these runs do not show:** why the stall was absent with a running access point or a joined
+  network (the firmware was not examined, and nothing a host can read was found that explains
   it); whether it holds on a second board, another build, another channel plan or a busier place; how
   long it holds beyond one day; what an access point with clients, or a joined network carrying
   traffic, does to it. With the access point up the board transmits beacons, hidden or not.
